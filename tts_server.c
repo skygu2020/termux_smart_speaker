@@ -36,6 +36,7 @@ typedef struct {
     int buffer_count, buffer_size;
     int read_index, write_index, queued_count;
     int playing, should_stop, producer_done, playback_complete;
+    int sl_started; // OpenSL ES 播放状态只启动一次，跨请求保持队列连续
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 } StreamPlayer;
@@ -156,25 +157,35 @@ static int stream_player_enqueue(StreamPlayer *p,const short *data,int n) {
 }
 
 // 仅在合成请求互斥锁保护下调用。
+// 不在请求之间 STOP/Clear：Clear 与 STOPPED 可能引发旧队列回调，
+// 旧回调若落在下一请求重置计数之后，会污染新请求的 queued_count/read_index。
+// OpenSL ES 播放器保持 PLAYING，队列排空后等待下一请求继续 Enqueue。
 static int stream_player_start(StreamPlayer *p) {
     pthread_mutex_lock(&p->mutex);
-    p->should_stop=1; p->playing=0;
-    pthread_cond_broadcast(&p->cond);
-    pthread_mutex_unlock(&p->mutex);
-    (*p->playerPlay)->SetPlayState(p->playerPlay,SL_PLAYSTATE_STOPPED);
-    (*p->playerBufferQueue)->Clear(p->playerBufferQueue);
-    pthread_mutex_lock(&p->mutex);
-    p->read_index=0; p->write_index=0; p->queued_count=0;
-    p->playing=1; p->should_stop=0; p->producer_done=0; p->playback_complete=0;
-    pthread_mutex_unlock(&p->mutex);
-    SLresult r=(*p->playerPlay)->SetPlayState(p->playerPlay,SL_PLAYSTATE_PLAYING);
-    if(r!=SL_RESULT_SUCCESS) {
-        pthread_mutex_lock(&p->mutex);
-        p->playing=0; p->should_stop=1;
-        pthread_cond_broadcast(&p->cond);
+    if (p->should_stop || p->queued_count != 0 ||
+        (p->sl_started && !p->playback_complete)) {
         pthread_mutex_unlock(&p->mutex);
-        fprintf(stderr,"[TTS] 设置播放状态失败: %u\n",(unsigned)r);
+        fprintf(stderr, "[TTS] 播放器状态异常，拒绝启动新请求\n");
         return -1;
+    }
+    p->playing = 1;
+    p->producer_done = 0;
+    p->playback_complete = 0;
+    pthread_mutex_unlock(&p->mutex);
+
+    if (!p->sl_started) {
+        SLresult r = (*p->playerPlay)->SetPlayState(
+            p->playerPlay, SL_PLAYSTATE_PLAYING);
+        if (r != SL_RESULT_SUCCESS) {
+            pthread_mutex_lock(&p->mutex);
+            p->playing = 0;
+            p->should_stop = 1;
+            pthread_cond_broadcast(&p->cond);
+            pthread_mutex_unlock(&p->mutex);
+            fprintf(stderr, "[TTS] 设置播放状态失败: %u\n", (unsigned)r);
+            return -1;
+        }
+        p->sl_started = 1;
     }
     return 0;
 }
