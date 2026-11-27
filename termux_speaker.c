@@ -12,28 +12,15 @@
 #include "sherpa-onnx/c-api/c-api.h"
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
-#include "zeroclaw_client.h"
-#include "nullclaw_client.h"
+#include "opencode_client.h"
 
 // ============= 配置 =============
 #define SAMPLE_RATE 16000
 #define BUFFER_SIZE 512
 #define VAD_WINDOW_SIZE 512
 #define MAX_SEGMENT_DURATION 10
-#define LLM_URL "http://127.0.0.1:11434/v1/completions"
-#define LLM_API_KEY ""
-#define ZEROHook "http://127.0.0.1:42617/webhook"
-#define ZERO_API_KEY ""
 #define TTS_URL "http://127.0.0.1:8080/v1/audio/speech"
 
-
-// 定义客户端类型
-typedef enum {
-    CLIENT_ZEROCLAW = 0,
-    CLIENT_NULLCLAW = 1
-} ClientType;
-
-static ClientType g_client_type = CLIENT_ZEROCLAW;
 
 // ============= 唤醒随机回复语 =============
 static const char* wake_responses[] = {
@@ -351,146 +338,6 @@ static char* http_post(const char* url, const char* json_body) {
     return response_text;
 }
 
-// ============= 调用 webhook =============
-static char* call_zero(const char* message) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return NULL;
-    
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "message", message);
-    cJSON_AddTrueToObject(root, "auto_execute");
-    
-    char* json_body = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    
-    printf("[HOOK] 请求: %s\n", json_body);
-    
-    struct curl_slist* headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    
-    char auth_header[256];
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", ZERO_API_KEY);
-    headers = curl_slist_append(headers, auth_header);
-    
-    HttpResponse resp = {0};
-    resp.data = malloc(1);
-    resp.data[0] = '\0';
-    resp.size = 0;
-    
-    curl_easy_setopt(curl, CURLOPT_URL, ZEROHook);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-    
-    CURLcode res = curl_easy_perform(curl);
-    
-    char* result = NULL;
-    
-    if (res == CURLE_OK && resp.size > 0) {
-        printf("[HOOK] 原始响应: %s\n", resp.data);
-        
-        cJSON* json = cJSON_Parse(resp.data);
-        if (json) {
-            cJSON* response = cJSON_GetObjectItem(json, "response");
-            if (response && cJSON_IsString(response)) {
-                result = strdup(response->valuestring);
-                while (*result == ' ' || *result == '\n') result++;
-                char* end = result + strlen(result) - 1;
-                while (end > result && (*end == ' ' || *end == '\n')) end--;
-                *(end + 1) = '\0';
-            }
-            cJSON_Delete(json);
-        }
-    } else {
-        printf("[HOOK] CURL 错误: %s\n", curl_easy_strerror(res));
-    }
-    
-    free(json_body);
-    free(resp.data);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    
-    return result;
-}
-
-// ============= 调用 LLM =============
-static char* call_llm(const char* prompt) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return NULL;
-    
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "prompt", prompt);
-    cJSON_AddNumberToObject(root, "max_tokens", 256);
-    cJSON_AddNumberToObject(root, "temperature", 0.7);
-    cJSON_AddFalseToObject(root, "stream");
-    
-    cJSON* stop_array = cJSON_CreateArray();
-    cJSON_AddItemToArray(stop_array, cJSON_CreateString("<think>"));
-    cJSON_AddItemToObject(root, "stop", stop_array);
-    
-    char* json_body = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    
-    printf("[LLM] 请求: %s\n", json_body);
-    
-    struct curl_slist* headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    
-    char auth_header[256];
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", LLM_API_KEY);
-    headers = curl_slist_append(headers, auth_header);
-    
-    HttpResponse resp = {0};
-    resp.data = malloc(1);
-    resp.data[0] = '\0';
-    resp.size = 0;
-    
-    curl_easy_setopt(curl, CURLOPT_URL, LLM_URL);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-    
-    CURLcode res = curl_easy_perform(curl);
-    
-    char* result = NULL;
-    
-    if (res == CURLE_OK && resp.size > 0) {
-        printf("[LLM] 原始响应: %s\n", resp.data);
-        
-        cJSON* json = cJSON_Parse(resp.data);
-        if (json) {
-            cJSON* choices = cJSON_GetObjectItem(json, "choices");
-            if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-                cJSON* first = cJSON_GetArrayItem(choices, 0);
-                if (first) {
-                    cJSON* text = cJSON_GetObjectItem(first, "text");
-                    if (text && cJSON_IsString(text)) {
-                        result = strdup(text->valuestring);
-                        while (*result == ' ' || *result == '\n') result++;
-                        char* end = result + strlen(result) - 1;
-                        while (end > result && (*end == ' ' || *end == '\n')) end--;
-                        *(end + 1) = '\0';
-                    }
-                }
-            }
-            cJSON_Delete(json);
-        }
-    } else {
-        printf("[LLM] CURL 错误: %s\n", curl_easy_strerror(res));
-    }
-    
-    free(json_body);
-    free(resp.data);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    
-    return result;
-}
-
 static void rebuild_kws(void) {
     printf("[KWS] 重建唤醒词检测器...\n");
     
@@ -554,11 +401,7 @@ static void speak_text(const char* text) {
 
 // 统一的发送函数
 static char* send_to_agent(const char* message) {
-    if (g_client_type == CLIENT_ZEROCLAW) {
-        return zeroclaw_send_message(message);
-    } else {
-        return nullclaw_send_message(message);
-    }
+    return opencode_send_message(message);
 }
 
 // ============= 处理识别结果 =============
@@ -1033,22 +876,12 @@ int main() {
     
     curl_global_init(CURL_GLOBAL_ALL);
     
-    
-     // 初始化 ZeroClaw WebSocket 客户端
-    if (zeroclaw_init("192.168.0.224", 42617, ZERO_API_KEY, "b75874b3-2612-4d9f-b65d-69cc203813ba") != 0) {
-        zeroclaw_set_timeout(120);
-        printf("⚠️ ZeroClaw WebSocket 初始化失败\n");
+
+    if (opencode_init() != 0) {
+        printf("⚠️ OpenCode 初始化失败；语音识别仍可运行，发送消息时会重试\n");
     } else {
-        printf("✅ ZeroClaw WebSocket 连接成功\n");
+        printf("✅ OpenCode 语音会话已就绪\n");
     }
-    /*
-    if (nullclaw_init("192.168.0.224", 42617, ZERO_API_KEY, "c-session-1") == 0) {
-            g_client_type = CLIENT_NULLCLAW;
-            printf("✅ 使用 NullClaw 连接\n");
-        } else {
-            printf("❌ 所有连接方式均失败\n");
-    }
-    */
     if (init_wake_word() != 0) {
         printf("⚠️ 唤醒词功能未启用，将一直处于唤醒状态\n");
         g_wake_word_detected = 1;  // 降级为一直识别
@@ -1069,9 +902,6 @@ int main() {
         return 1;
     }
     
-    pthread_t thread;
-    //pthread_create(&thread, NULL, vad_asr_thread, NULL);
-    
     start_recording();
     
     printf("✅ 系统就绪，请说话...\n");
@@ -1081,10 +911,9 @@ int main() {
         sleep(1);
     }
     
-    zeroclaw_close();
     stop_recording();
     g_running = 0;
-    pthread_join(thread, NULL);
+    opencode_close();
     
     if (g_vad) SherpaOnnxDestroyVoiceActivityDetector(g_vad);
     if (g_recognizer) SherpaOnnxDestroyOnlineRecognizer(g_recognizer);
