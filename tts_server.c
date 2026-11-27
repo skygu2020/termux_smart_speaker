@@ -21,6 +21,7 @@
 // ============= 全局变量 =============
 static volatile int g_running = 1;
 static const SherpaOnnxOfflineTts *g_tts = NULL;
+static pthread_mutex_t g_synthesis_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============= OpenSL ES 播放器 =============
 typedef struct {
@@ -31,175 +32,176 @@ typedef struct {
     SLPlayItf playerPlay;
     SLBufferQueueItf playerBufferQueue;
     SLVolumeItf playerVolume;
-    
-    short** buffers;
-    int buffer_count;
-    int buffer_size;
-    int current_buffer;
-    volatile int playing;
-    volatile int has_data;
-    volatile int should_stop;
-    volatile int playback_complete;
+    short **buffers;
+    int buffer_count, buffer_size;
+    int read_index, write_index, queued_count;
+    int playing, should_stop, producer_done, playback_complete;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 } StreamPlayer;
 
 static StreamPlayer *g_player = NULL;
 
-// 回调函数
-static void player_callback(SLBufferQueueItf caller, void* context) {
-    StreamPlayer* player = (StreamPlayer*)context;
-    
-    pthread_mutex_lock(&player->mutex);
-    
-    if (player->should_stop) {
-        pthread_mutex_unlock(&player->mutex);
-        return;
+// OpenSL ES 每消费完一个缓冲区调用一次。
+static void player_callback(SLBufferQueueItf caller, void *context) {
+    (void)caller;
+    StreamPlayer *p = (StreamPlayer *)context;
+    pthread_mutex_lock(&p->mutex);
+    if (!p->should_stop) {
+        if (p->queued_count > 0) {
+            p->queued_count--;
+            p->read_index = (p->read_index + 1) % p->buffer_count;
+        }
+        if (p->producer_done && p->queued_count == 0) {
+            p->playing = 0;
+            p->playback_complete = 1;
+        }
+        pthread_cond_broadcast(&p->cond);
     }
-    
-    // 检查是否还有数据需要播放
-    if (!player->has_data) {
-        // 没有更多数据，停止播放
-        player->playing = 0;
-        player->playback_complete = 1;
-        pthread_cond_signal(&player->cond);
-        pthread_mutex_unlock(&player->mutex);
-        return;
-    }
-    
-    player->current_buffer = (player->current_buffer + 1) % player->buffer_count;
-    player->has_data = 0;
-    pthread_cond_signal(&player->cond);
-    
-    pthread_mutex_unlock(&player->mutex);
+    pthread_mutex_unlock(&p->mutex);
 }
 
-
-// 初始化播放器
-static StreamPlayer* stream_player_init(int sample_rate, int buffer_count) {
-    SLresult result;
-    StreamPlayer* player = (StreamPlayer*)calloc(1, sizeof(StreamPlayer));
-    if (!player) return NULL;
-    
-    player->buffer_count = buffer_count;
-    player->buffer_size = AUDIO_CHUNK_SIZE;
-    player->current_buffer = 0;
-    player->playing = 0;
-    player->has_data = 0;
-    player->should_stop = 0;
-    player->playback_complete = 0;
-    pthread_mutex_init(&player->mutex, NULL);
-    pthread_cond_init(&player->cond, NULL);
-    
-    player->buffers = (short**)malloc(buffer_count * sizeof(short*));
-    for (int i = 0; i < buffer_count; i++) {
-        player->buffers[i] = (short*)malloc(player->buffer_size * sizeof(short));
-        memset(player->buffers[i], 0, player->buffer_size * sizeof(short));
+static StreamPlayer *stream_player_init(int sample_rate, int buffer_count) {
+    SLresult r = SL_RESULT_SUCCESS;
+    StreamPlayer *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->buffer_count = buffer_count;
+    p->buffer_size = AUDIO_CHUNK_SIZE;
+    pthread_mutex_init(&p->mutex, NULL);
+    pthread_cond_init(&p->cond, NULL);
+    p->buffers = calloc((size_t)buffer_count, sizeof(short *));
+    if (!p->buffers) goto error;
+    for (int i=0;i<buffer_count;i++) {
+        p->buffers[i] = calloc((size_t)p->buffer_size, sizeof(short));
+        if (!p->buffers[i]) goto error;
     }
-    
-    result = slCreateEngine(&player->engineObject, 0, NULL, 0, NULL, NULL);
-    if (result != SL_RESULT_SUCCESS) goto error;
-    (*player->engineObject)->Realize(player->engineObject, SL_BOOLEAN_FALSE);
-    (*player->engineObject)->GetInterface(player->engineObject, SL_IID_ENGINE, &player->engineEngine);
-    
-    (*player->engineEngine)->CreateOutputMix(player->engineEngine, &player->outputMixObject, 0, NULL, NULL);
-    (*player->outputMixObject)->Realize(player->outputMixObject, SL_BOOLEAN_FALSE);
-    
-    SLDataLocator_AndroidSimpleBufferQueue loc_bq = {SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, buffer_count};
-    SLDataFormat_PCM format_pcm = {
-        SL_DATAFORMAT_PCM,
-        1,
-        sample_rate * 1000,
-        SL_PCMSAMPLEFORMAT_FIXED_16,
-        SL_PCMSAMPLEFORMAT_FIXED_16,
-        SL_SPEAKER_FRONT_CENTER,
-        SL_BYTEORDER_LITTLEENDIAN
+
+    r = slCreateEngine(&p->engineObject,0,NULL,0,NULL,NULL);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->engineObject)->Realize(p->engineObject,SL_BOOLEAN_FALSE);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->engineObject)->GetInterface(p->engineObject,SL_IID_ENGINE,&p->engineEngine);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->engineEngine)->CreateOutputMix(p->engineEngine,&p->outputMixObject,0,NULL,NULL);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->outputMixObject)->Realize(p->outputMixObject,SL_BOOLEAN_FALSE);
+    if (r != SL_RESULT_SUCCESS) goto error;
+
+    SLDataLocator_AndroidSimpleBufferQueue loc = {
+        SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,(SLuint32)buffer_count
     };
-    
-    SLDataSource audioSrc = {&loc_bq, &format_pcm};
-    SLDataLocator_OutputMix loc_outmix = {SL_DATALOCATOR_OUTPUTMIX, player->outputMixObject};
-    SLDataSink audioSnk = {&loc_outmix, NULL};
-    
-    const SLInterfaceID ids[] = {SL_IID_BUFFERQUEUE, SL_IID_VOLUME};
-    const SLboolean req[] = {SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE};
-    
-    (*player->engineEngine)->CreateAudioPlayer(player->engineEngine, &player->playerObject,
-                                               &audioSrc, &audioSnk, 2, ids, req);
-    (*player->playerObject)->Realize(player->playerObject, SL_BOOLEAN_FALSE);
-    (*player->playerObject)->GetInterface(player->playerObject, SL_IID_PLAY, &player->playerPlay);
-    (*player->playerObject)->GetInterface(player->playerObject, SL_IID_BUFFERQUEUE, &player->playerBufferQueue);
-    (*player->playerObject)->GetInterface(player->playerObject, SL_IID_VOLUME, &player->playerVolume);
-    
-    (*player->playerBufferQueue)->RegisterCallback(player->playerBufferQueue, player_callback, player);
-    
-    return player;
-    
+    SLDataFormat_PCM fmt = {
+        SL_DATAFORMAT_PCM,1,(SLuint32)(sample_rate*1000),
+        SL_PCMSAMPLEFORMAT_FIXED_16,SL_PCMSAMPLEFORMAT_FIXED_16,
+        SL_SPEAKER_FRONT_CENTER,SL_BYTEORDER_LITTLEENDIAN
+    };
+    SLDataSource src = {&loc,&fmt};
+    SLDataLocator_OutputMix outloc = {SL_DATALOCATOR_OUTPUTMIX,p->outputMixObject};
+    SLDataSink sink = {&outloc,NULL};
+    const SLInterfaceID ids[] = {SL_IID_BUFFERQUEUE,SL_IID_VOLUME};
+    const SLboolean req[] = {SL_BOOLEAN_TRUE,SL_BOOLEAN_TRUE};
+    r = (*p->engineEngine)->CreateAudioPlayer(p->engineEngine,&p->playerObject,&src,&sink,2,ids,req);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->playerObject)->Realize(p->playerObject,SL_BOOLEAN_FALSE);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->playerObject)->GetInterface(p->playerObject,SL_IID_PLAY,&p->playerPlay);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->playerObject)->GetInterface(p->playerObject,SL_IID_BUFFERQUEUE,&p->playerBufferQueue);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->playerObject)->GetInterface(p->playerObject,SL_IID_VOLUME,&p->playerVolume);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    r = (*p->playerBufferQueue)->RegisterCallback(p->playerBufferQueue,player_callback,p);
+    if (r != SL_RESULT_SUCCESS) goto error;
+    return p;
+
 error:
-    fprintf(stderr, "播放器初始化失败\n");
+    fprintf(stderr,"[TTS] 播放器初始化失败 (SLresult=%u)\n",(unsigned)r);
+    if (p->playerObject) (*p->playerObject)->Destroy(p->playerObject);
+    if (p->outputMixObject) (*p->outputMixObject)->Destroy(p->outputMixObject);
+    if (p->engineObject) (*p->engineObject)->Destroy(p->engineObject);
+    if (p->buffers) { for(int i=0;i<buffer_count;i++) free(p->buffers[i]); free(p->buffers); }
+    pthread_mutex_destroy(&p->mutex);
+    pthread_cond_destroy(&p->cond);
+    free(p);
     return NULL;
 }
 
-// 入队音频数据
-static void stream_player_enqueue(StreamPlayer* player, short* data, int num_samples) {
-    pthread_mutex_lock(&player->mutex);
-    
-    while (player->has_data && player->playing && !player->should_stop) {
-        pthread_cond_wait(&player->cond, &player->mutex);
-    }
-    
-    if (!player->playing || player->should_stop) {
-        pthread_mutex_unlock(&player->mutex);
-        return;
-    }
-    
-    int copy_size = num_samples > player->buffer_size ? player->buffer_size : num_samples;
-    memcpy(player->buffers[player->current_buffer], data, copy_size * sizeof(short));
-    
-    (*player->playerBufferQueue)->Enqueue(player->playerBufferQueue, 
-                                           player->buffers[player->current_buffer], 
-                                           copy_size * sizeof(short));
-    player->has_data = 1;
-    
-    pthread_mutex_unlock(&player->mutex);
-}
-
-// 开始播放
-static void stream_player_start(StreamPlayer* player) {
-    pthread_mutex_lock(&player->mutex);
-    player->playing = 1;
-    player->should_stop = 0;
-    player->has_data = 0;
-    player->playback_complete = 0;
-    pthread_mutex_unlock(&player->mutex);
-    (*player->playerPlay)->SetPlayState(player->playerPlay, SL_PLAYSTATE_PLAYING);
-}
-
-// 停止播放
-static void stream_player_stop(StreamPlayer* player) {
-    pthread_mutex_lock(&player->mutex);
-    player->playing = 0;
-    player->should_stop = 1;
-    pthread_cond_signal(&player->cond);
-    pthread_mutex_unlock(&player->mutex);
-    
-    (*player->playerPlay)->SetPlayState(player->playerPlay, SL_PLAYSTATE_STOPPED);
-    (*player->playerBufferQueue)->Clear(player->playerBufferQueue);
-}
-
-// 等待播放完成
-static void stream_player_wait(StreamPlayer* player) {
-    pthread_mutex_lock(&player->mutex);
-    while (player->playing && !player->should_stop && !player->playback_complete) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 100000000;
-        if (ts.tv_nsec >= 1000000000) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000;
+// 按播放器块大小拆分 PCM；队列满时等待消费回调，形成有界背压。
+static int stream_player_enqueue(StreamPlayer *p,const short *data,int n) {
+    int off=0;
+    while(off<n) {
+        pthread_mutex_lock(&p->mutex);
+        while(p->queued_count>=p->buffer_count && !p->should_stop)
+            pthread_cond_wait(&p->cond,&p->mutex);
+        if(p->should_stop || !p->playing || p->producer_done) {
+            pthread_mutex_unlock(&p->mutex); return -1;
         }
-        pthread_cond_timedwait(&player->cond, &player->mutex, &ts);
+        int count=n-off;
+        if(count>p->buffer_size) count=p->buffer_size;
+        int slot=p->write_index;
+        memcpy(p->buffers[slot],data+off,(size_t)count*sizeof(short));
+        SLresult r=(*p->playerBufferQueue)->Enqueue(
+            p->playerBufferQueue,p->buffers[slot],(SLuint32)((size_t)count*sizeof(short)));
+        if(r!=SL_RESULT_SUCCESS) {
+            pthread_mutex_unlock(&p->mutex);
+            fprintf(stderr,"[TTS] BufferQueue Enqueue 失败: %u\n",(unsigned)r);
+            return -1;
+        }
+        p->write_index=(p->write_index+1)%p->buffer_count;
+        p->queued_count++;
+        off+=count;
+        pthread_mutex_unlock(&p->mutex);
     }
-    pthread_mutex_unlock(&player->mutex);
+    return 0;
+}
+
+// 仅在合成请求互斥锁保护下调用。
+static int stream_player_start(StreamPlayer *p) {
+    pthread_mutex_lock(&p->mutex);
+    p->should_stop=1; p->playing=0;
+    pthread_cond_broadcast(&p->cond);
+    pthread_mutex_unlock(&p->mutex);
+    (*p->playerPlay)->SetPlayState(p->playerPlay,SL_PLAYSTATE_STOPPED);
+    (*p->playerBufferQueue)->Clear(p->playerBufferQueue);
+    pthread_mutex_lock(&p->mutex);
+    p->read_index=0; p->write_index=0; p->queued_count=0;
+    p->playing=1; p->should_stop=0; p->producer_done=0; p->playback_complete=0;
+    pthread_mutex_unlock(&p->mutex);
+    SLresult r=(*p->playerPlay)->SetPlayState(p->playerPlay,SL_PLAYSTATE_PLAYING);
+    if(r!=SL_RESULT_SUCCESS) {
+        pthread_mutex_lock(&p->mutex);
+        p->playing=0; p->should_stop=1;
+        pthread_cond_broadcast(&p->cond);
+        pthread_mutex_unlock(&p->mutex);
+        fprintf(stderr,"[TTS] 设置播放状态失败: %u\n",(unsigned)r);
+        return -1;
+    }
+    return 0;
+}
+
+static void stream_player_finish(StreamPlayer *p) {
+    pthread_mutex_lock(&p->mutex);
+    p->producer_done=1;
+    if(p->queued_count==0) { p->playing=0; p->playback_complete=1; }
+    pthread_cond_broadcast(&p->cond);
+    pthread_mutex_unlock(&p->mutex);
+}
+
+static void stream_player_stop(StreamPlayer *p) {
+    if(!p) return;
+    pthread_mutex_lock(&p->mutex);
+    p->playing=0; p->should_stop=1; p->playback_complete=1;
+    pthread_cond_broadcast(&p->cond);
+    pthread_mutex_unlock(&p->mutex);
+    if(p->playerPlay) (*p->playerPlay)->SetPlayState(p->playerPlay,SL_PLAYSTATE_STOPPED);
+    if(p->playerBufferQueue) (*p->playerBufferQueue)->Clear(p->playerBufferQueue);
+}
+
+static void stream_player_wait(StreamPlayer *p) {
+    pthread_mutex_lock(&p->mutex);
+    while(!p->playback_complete && !p->should_stop)
+        pthread_cond_wait(&p->cond,&p->mutex);
+    pthread_mutex_unlock(&p->mutex);
 }
 
 // 销毁播放器
@@ -218,117 +220,82 @@ static void stream_player_destroy(StreamPlayer* player) {
     free(player);
 }
 
-// ============= TTS 回调 =============
+// ============= HTTP 请求处理 =============
 typedef struct {
-    StreamPlayer* player;
-    int client_fd;
-    int is_stream;
+    StreamPlayer *player;
+    int failed;
     int chunk_count;
-} TtsCallbackData;
+} TtsProgressContext;
 
-// 音频回调
-static void tts_callback(const float* samples, int n, void* user_data) {
-    TtsCallbackData* data = (TtsCallbackData*)user_data;
-    if (!data->player->playing) return;
-    
-    // 转换 float 到 short
-    short pcm[n];
-    for (int i = 0; i < n; i++) {
-        float s = samples[i];
-        if (s > 1.0f) s = 1.0f;
-        if (s < -1.0f) s = -1.0f;
-        pcm[i] = (short)(s * 32767.0f);
+// 回调提供的是刚生成的 PCM；指针仅在本次回调期间有效。
+static int32_t tts_progress_callback(const float *samples,int32_t n,float progress,void *arg) {
+    (void)progress;
+    TtsProgressContext *ctx=(TtsProgressContext *)arg;
+    if(!ctx || !samples || n<=0) return 1;
+    short pcm[AUDIO_CHUNK_SIZE];
+    int off=0;
+    while(off<n) {
+        int count=n-off;
+        if(count>AUDIO_CHUNK_SIZE) count=AUDIO_CHUNK_SIZE;
+        for(int i=0;i<count;i++) {
+            float v=samples[off+i];
+            if(v>1.0f) v=1.0f;
+            if(v< -1.0f) v= -1.0f;
+            pcm[i]=(short)(v*32767.0f);
+        }
+        if(stream_player_enqueue(ctx->player,pcm,count)!=0) {
+            ctx->failed=1;
+            return 0;
+        }
+        off+=count;
     }
-    
-    // 流式输出到 HTTP
-    if (data->is_stream && data->client_fd > 0) {
-        char chunk_data[256];
-        snprintf(chunk_data, sizeof(chunk_data), "data: chunk_%d\n\n", data->chunk_count++);
-        write(data->client_fd, chunk_data, strlen(chunk_data));
-    }
-    
-    // 播放
-    stream_player_enqueue(data->player, pcm, n);
+    ctx->chunk_count++;
+    return 1;
 }
 
-// ============= HTTP 请求处理 =============
-static void handle_synthesize(const char* text, float speed, int client_fd, int is_stream) {
-    printf("[TTS] 开始合成: %s\n", text);
-    
-    // 开始播放
-    stream_player_start(g_player);
-    
-    // 生成音频
-    const SherpaOnnxGeneratedAudio *audio = SherpaOnnxOfflineTtsGenerate(
-        g_tts, text, 0, speed);
-    
-    if (!audio || audio->n <= 0) {
-        printf("[TTS] 合成失败\n");
-        if (client_fd > 0) {
-            const char* error_msg = "data: [ERROR]\n\n";
-            write(client_fd, error_msg, strlen(error_msg));
-            close(client_fd);
-        }
+static void handle_synthesize(const char *text,float speed,int client_fd,int is_stream) {
+    pthread_mutex_lock(&g_synthesis_mutex);
+    printf("[TTS] 开始增量合成: %s\n",text);
+
+    if(stream_player_start(g_player)!=0) {
+        if(client_fd>0) { shutdown(client_fd,SHUT_RDWR); close(client_fd); }
+        pthread_mutex_unlock(&g_synthesis_mutex);
         return;
     }
-    
-    printf("[TTS] 合成成功: %d 采样, %.2f 秒\n", audio->n, (float)audio->n / 16000.0f);
-    
-    // 分块发送并播放
-    int chunk_size = AUDIO_CHUNK_SIZE;
-    int offset = 0;
-    int chunk_id = 0;
-    
-    while (offset < audio->n && !g_player->should_stop) {
-        int remaining = audio->n - offset;
-        int send_size = remaining > chunk_size ? chunk_size : remaining;
-        
-        // 转换 float 到 short
-        short pcm[send_size];
-        for (int i = 0; i < send_size; i++) {
-            float s = audio->samples[offset + i];
-            if (s > 1.0f) s = 1.0f;
-            if (s < -1.0f) s = -1.0f;
-            pcm[i] = (short)(s * 32767.0f);
-        }
-        
-        // 流式输出到 HTTP（可选）
-        if (is_stream && client_fd > 0) {
-            char chunk_data[256];
-            snprintf(chunk_data, sizeof(chunk_data), "data: chunk_%d\n\n", chunk_id++);
-            write(client_fd, chunk_data, strlen(chunk_data));
-        }
-        
-        // 播放
-        stream_player_enqueue(g_player, pcm, send_size);
-        offset += send_size;
-        
-        // 让出 CPU，避免阻塞
-        usleep(10000);
+
+    SherpaOnnxGenerationConfig cfg;
+    memset(&cfg,0,sizeof(cfg));
+    cfg.sid=0;
+    cfg.speed=speed;
+    cfg.silence_scale=0.2f;
+
+    TtsProgressContext ctx={.player=g_player,.failed=0,.chunk_count=0};
+    const SherpaOnnxGeneratedAudio *audio=SherpaOnnxOfflineTtsGenerateWithConfig(
+        g_tts,text,&cfg,tts_progress_callback,&ctx);
+
+    if(!audio || audio->n<=0 || ctx.failed) {
+        fprintf(stderr,"[TTS] 增量合成失败%s\n",ctx.failed?"（播放队列入队失败）":"");
+        stream_player_stop(g_player);
+    } else {
+        printf("[TTS] 合成完成: %d samples, %.2f 秒, 回调片段 %d 个\n",
+               audio->n,(float)audio->n/16000.0f,ctx.chunk_count);
+        stream_player_finish(g_player);
+        printf("[TTS] 等待播放队列排空...\n");
+        stream_player_wait(g_player);
+        printf("[TTS] 播放完成\n");
     }
-    
-    // 标记没有更多数据了
-    pthread_mutex_lock(&g_player->mutex);
-    g_player->has_data = 0;
-    pthread_mutex_unlock(&g_player->mutex);
-    
-    // 等待播放完成
-    printf("[TTS] 等待播放完成...\n");
-    stream_player_wait(g_player);
-    printf("[TTS] 播放完成\n");
-    
-    // 发送完成标记并关闭连接
-    if (client_fd > 0) {
-        if (is_stream) {
-            const char* done_msg = "data: [DONE]\n\n";
-            write(client_fd, done_msg, strlen(done_msg));
+
+    if(audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+
+    if(client_fd>0) {
+        if(is_stream) {
+            const char *msg=(ctx.failed || !audio)?"data: [ERROR]\n\n":"data: [DONE]\n\n";
+            write(client_fd,msg,strlen(msg));
         }
-        shutdown(client_fd, SHUT_RDWR);
+        shutdown(client_fd,SHUT_RDWR);
         close(client_fd);
-        printf("[HTTP] 连接已关闭\n");
     }
-    
-    SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+    pthread_mutex_unlock(&g_synthesis_mutex);
 }
 
 // ============= HTTP 服务器 =============
@@ -379,13 +346,20 @@ static void* handle_client(void* arg) {
     cJSON* input = cJSON_GetObjectItem(json, "input");
     cJSON* speed = cJSON_GetObjectItem(json, "speed");
     
-    const char* text = input ? input->valuestring : "";
-    float speed_val = speed ? (float)speed->valuedouble : 1.0f;
-    
+    const char *input_text = cJSON_IsString(input) ? input->valuestring : "";
+    char *text = strdup(input_text);
+    float speed_val = cJSON_IsNumber(speed) ? (float)speed->valuedouble : 1.0f;
+
     cJSON_Delete(json);
-    
-    printf("[HTTP] 收到: %s\n", text);
-    
+    if (!text) {
+        const char *response = "HTTP/1.1 500 Internal Server Error\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n";
+        write(client_fd, response, strlen(response));
+        close(client_fd);
+        return NULL;
+    }
+
+    printf("[HTTP] 收到: %s\\n", text);
+
     int is_stream = (strstr(buffer, "text/event-stream") != NULL);
     
     // 发送响应头
@@ -408,6 +382,7 @@ static void* handle_client(void* arg) {
     
     // 处理合成
     handle_synthesize(text, speed_val, client_fd, is_stream);
+    free(text);
     
     return NULL;
 }
