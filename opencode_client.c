@@ -124,36 +124,108 @@ static void trim(char *s) {
     while (n && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
 }
 
-static int discover_service(void) {
-    char *argv_status[] = { (char *)OPENCODE_CLI, "service", "status", NULL };
-    char *status = capture_command(argv_status);
+/*
+ * The service registration is the same file used by OpenCode's own client
+ * discovery. It contains the advertised URL and, when enabled, the private
+ * service password. Reading it avoids relying on shell aliases or parsing
+ * human-readable CLI output.
+ */
+static int discover_from_registration(void) {
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_STATE_HOME");
+    char path[1200], *contents = NULL;
+    FILE *fp;
+    long length;
+    cJSON *json, *url_item, *password_item;
     char *colon;
     int port;
 
-    if (!status || !*status) {
-        fprintf(stderr, "[OpenCode] 无法读取 service status，请先运行 opencode2 service start\n");
-        free(status);
+    if (xdg && *xdg) {
+        if (snprintf(path, sizeof(path), "%s/opencode/service.json", xdg) >= (int)sizeof(path))
+            return -1;
+    } else {
+        if (!home || !*home) return -1;
+        if (snprintf(path, sizeof(path), "%s/.local/state/opencode/service.json", home) >= (int)sizeof(path))
+            return -1;
+    }
+
+    fp = fopen(path, "rb");
+    if (!fp) return -1;
+    if (fseek(fp, 0, SEEK_END) != 0 || (length = ftell(fp)) <= 0 || length > 65536 ||
+        fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
         return -1;
     }
-    trim(status);
-    colon = strrchr(status, ':');
+    contents = (char *)malloc((size_t)length + 1);
+    if (!contents) {
+        fclose(fp);
+        return -1;
+    }
+    if (fread(contents, 1, (size_t)length, fp) != (size_t)length) {
+        fclose(fp);
+        free(contents);
+        return -1;
+    }
+    fclose(fp);
+    contents[length] = '\0';
+
+    json = cJSON_Parse(contents);
+    free(contents);
+    if (!json) return -1;
+
+    url_item = cJSON_GetObjectItemCaseSensitive(json, "url");
+    password_item = cJSON_GetObjectItemCaseSensitive(json, "password");
+    if (!url_item || !cJSON_IsString(url_item) || !url_item->valuestring) {
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    colon = strrchr(url_item->valuestring, ':');
     if (!colon || (port = atoi(colon + 1)) < 1 || port > 65535) {
-        fprintf(stderr, "[OpenCode] 无法解析服务地址: %s\n", status);
-        free(status);
+        cJSON_Delete(json);
         return -1;
     }
     snprintf(g_base_url, sizeof(g_base_url), "http://127.0.0.1:%d", port);
-    free(status);
+
+    if (password_item && cJSON_IsString(password_item) &&
+        password_item->valuestring && *password_item->valuestring) {
+        g_password = strdup(password_item->valuestring);
+    }
+    cJSON_Delete(json);
+    return 0;
+}
+
+static int discover_service(void) {
+    if (discover_from_registration() == 0) return 0;
+
+    /* Fallback for non-default XDG/channel layouts. */
+    {
+        char *argv_status[] = { (char *)OPENCODE_CLI, "service", "status", NULL };
+        char *status = capture_command(argv_status);
+        char *colon;
+        int port;
+
+        if (!status || !*status) {
+            fprintf(stderr, "[OpenCode] 无法读取服务注册文件，也无法执行 opencode2 service status\n");
+            free(status);
+            return -1;
+        }
+        trim(status);
+        colon = strrchr(status, ':');
+        if (!colon || (port = atoi(colon + 1)) < 1 || port > 65535) {
+            fprintf(stderr, "[OpenCode] 无法解析服务地址: %s\n", status);
+            free(status);
+            return -1;
+        }
+        snprintf(g_base_url, sizeof(g_base_url), "http://127.0.0.1:%d", port);
+        free(status);
+    }
 
     {
         char *argv_password[] = { (char *)OPENCODE_CLI, "service", "get", "password", NULL };
         char *password = capture_command(argv_password);
         if (password) {
             trim(password);
-            if (strncmp(password, "Password:", 9) == 0) {
-                memmove(password, password + 9, strlen(password + 9) + 1);
-                trim(password);
-            }
             if (*password) g_password = password;
             else free(password);
         }
