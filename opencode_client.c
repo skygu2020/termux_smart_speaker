@@ -372,7 +372,8 @@ static int wait_for_session(void) {
     int i;
 
     snprintf(path, sizeof(path), "/api/experimental/session/%s/wait", g_session_id);
-    if (api_request("POST", path, "{}", &response, &status) == 0 && status == 204) {
+    /* This endpoint has no request body in OpenCode v2.4.2. */
+    if (api_request("POST", path, NULL, &response, &status) == 0 && status == 204) {
         free(response);
         return 0;
     }
@@ -381,8 +382,8 @@ static int wait_for_session(void) {
     /* Fallback for builds where the experimental wait route is unavailable. */
     snprintf(path, sizeof(path), "/api/session/active");
     for (i = 0; i < 600; i++) {
-        cJSON *json, *data;
-        int active = 0, n, j;
+        cJSON *json, *data, *entry;
+        int active = 0;
         response = NULL;
         status = 0;
         if (api_request("GET", path, NULL, &response, &status) != 0 || status != 200) {
@@ -392,17 +393,14 @@ static int wait_for_session(void) {
         }
         json = cJSON_Parse(response);
         data = json ? cJSON_GetObjectItemCaseSensitive(json, "data") : NULL;
-        if (cJSON_IsArray(data)) {
-            n = cJSON_GetArraySize(data);
-            for (j = 0; j < n; j++) {
-                cJSON *item = cJSON_GetArrayItem(data, j);
-                cJSON *id = cJSON_IsObject(item) ? cJSON_GetObjectItemCaseSensitive(item, "id") : NULL;
-                if (id && cJSON_IsString(id) && strcmp(id->valuestring, g_session_id) == 0) {
-                    active = 1;
-                    break;
-                }
-            }
-        }
+        /*
+         * OpenCode v2.4.2 returns active sessions as an object keyed by
+         * session ID, not as an array of objects.
+         */
+        entry = cJSON_IsObject(data)
+            ? cJSON_GetObjectItemCaseSensitive(data, g_session_id)
+            : NULL;
+        if (entry) active = 1;
         cJSON_Delete(json);
         free(response);
         if (!active) return 0;
