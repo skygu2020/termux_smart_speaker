@@ -507,26 +507,30 @@ static char *read_latest_assistant_text(void) {
     count = cJSON_GetArraySize(data);
     for (i = 0; i < count; i++) {
         cJSON *entry = cJSON_GetArrayItem(data, i);
-        cJSON *info = cJSON_GetObjectItemCaseSensitive(entry, "info");
-        cJSON *role = info ? cJSON_GetObjectItemCaseSensitive(info, "role") : NULL;
-        cJSON *parts = cJSON_GetObjectItemCaseSensitive(entry, "parts");
-        cJSON *text;
+        cJSON *type = cJSON_GetObjectItemCaseSensitive(entry, "type");
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(entry, "content");
         int j, part_count;
-        size_t used = 0, cap = 1;
-        char *joined = (char *)calloc(1, cap);
+        size_t used = 0;
+        char *joined = (char *)calloc(1, 1);
 
-        if (!role || !cJSON_IsString(role) || strcmp(role->valuestring, "assistant") != 0 ||
-            !cJSON_IsArray(parts)) {
+        /*
+         * OpenCode v2.4.2 Session.Message.Info uses:
+         *   { "type": "assistant", "content": [{ "type": "text", "text": "..." }] }
+         * Reasoning and tool content are intentionally excluded from TTS.
+         */
+        if (!type || !cJSON_IsString(type) || strcmp(type->valuestring, "assistant") != 0 ||
+            !cJSON_IsArray(content)) {
             free(joined);
             continue;
         }
 
-        part_count = cJSON_GetArraySize(parts);
+        part_count = cJSON_GetArraySize(content);
         for (j = 0; j < part_count; j++) {
-            cJSON *part = cJSON_GetArrayItem(parts, j);
-            cJSON *type = cJSON_GetObjectItemCaseSensitive(part, "type");
-            text = cJSON_GetObjectItemCaseSensitive(part, "text");
-            if (type && cJSON_IsString(type) && strcmp(type->valuestring, "text") == 0 &&
+            cJSON *part = cJSON_GetArrayItem(content, j);
+            cJSON *part_type = cJSON_GetObjectItemCaseSensitive(part, "type");
+            cJSON *text = cJSON_GetObjectItemCaseSensitive(part, "text");
+            if (part_type && cJSON_IsString(part_type) &&
+                strcmp(part_type->valuestring, "text") == 0 &&
                 text && cJSON_IsString(text) && text->valuestring) {
                 size_t len = strlen(text->valuestring);
                 char *next = (char *)realloc(joined, used + len + 2);
