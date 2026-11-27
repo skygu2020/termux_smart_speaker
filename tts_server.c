@@ -223,6 +223,8 @@ static void stream_player_destroy(StreamPlayer* player) {
 // ============= HTTP 请求处理 =============
 typedef struct {
     StreamPlayer *player;
+    int client_fd;
+    int is_stream;
     int failed;
     int chunk_count;
 } TtsProgressContext;
@@ -249,6 +251,11 @@ static int32_t tts_progress_callback(const float *samples,int32_t n,float progre
         }
         off+=count;
     }
+    if (ctx->is_stream && ctx->client_fd > 0) {
+        char event[64];
+        int len = snprintf(event, sizeof(event), "data: chunk_%d\\n\\n", ctx->chunk_count);
+        if (len > 0) write(ctx->client_fd, event, (size_t)len);
+    }
     ctx->chunk_count++;
     return 1;
 }
@@ -269,7 +276,13 @@ static void handle_synthesize(const char *text,float speed,int client_fd,int is_
     cfg.speed=speed;
     cfg.silence_scale=0.2f;
 
-    TtsProgressContext ctx={.player=g_player,.failed=0,.chunk_count=0};
+    TtsProgressContext ctx={
+        .player=g_player,
+        .client_fd=client_fd,
+        .is_stream=is_stream,
+        .failed=0,
+        .chunk_count=0
+    };
     const SherpaOnnxGeneratedAudio *audio=SherpaOnnxOfflineTtsGenerateWithConfig(
         g_tts,text,&cfg,tts_progress_callback,&ctx);
 
