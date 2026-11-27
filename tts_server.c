@@ -253,7 +253,7 @@ static int32_t tts_progress_callback(const float *samples,int32_t n,float progre
     }
     if (ctx->is_stream && ctx->client_fd > 0) {
         char event[64];
-        int len = snprintf(event, sizeof(event), "data: chunk_%d\\n\\n", ctx->chunk_count);
+        int len = snprintf(event, sizeof(event), "data: chunk_%d\n\n", ctx->chunk_count);
         if (len > 0) write(ctx->client_fd, event, (size_t)len);
     }
     ctx->chunk_count++;
@@ -365,13 +365,13 @@ static void* handle_client(void* arg) {
 
     cJSON_Delete(json);
     if (!text) {
-        const char *response = "HTTP/1.1 500 Internal Server Error\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n";
+        const char *response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write(client_fd, response, strlen(response));
         close(client_fd);
         return NULL;
     }
 
-    printf("[HTTP] 收到: %s\\n", text);
+    printf("[HTTP] 收到: %s\n", text);
 
     int is_stream = (strstr(buffer, "text/event-stream") != NULL);
     
