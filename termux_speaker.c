@@ -434,7 +434,7 @@ static void speak_text_with_ids(const char* text, const char* session_id, const 
 }
 
 // 统一的发送函数
-// ============= ASR 中文句尾标点整理 =============
+// ============= ASR 中文标点整理 =============
 static int ends_with_text(const char* text, const char* suffix) {
     size_t text_len = strlen(text);
     size_t suffix_len = strlen(suffix);
@@ -442,8 +442,65 @@ static int ends_with_text(const char* text, const char* suffix) {
            memcmp(text + text_len - suffix_len, suffix, suffix_len) == 0;
 }
 
-// 在提交给 OpenCode 前补齐句尾标点。
-// 不改写识别内容，也不依赖额外模型；疑问语气采用保守的词尾规则判断。
+static int starts_with_at(const char* text, size_t len, size_t pos,
+                          const char* token) {
+    size_t token_len = strlen(token);
+    return pos + token_len <= len &&
+           memcmp(text + pos, token, token_len) == 0;
+}
+
+static int is_clause_boundary(const char* text, size_t len, size_t pos) {
+    static const char* connectors[] = {
+        "但是", "不过", "然而", "可是", "反而",
+        "然后", "接着", "随后", "后来", "最后",
+        "所以", "因此", "结果", "否则", "要不然",
+        "而且", "另外", "同时", "此外", "其实", "只是"
+    };
+    for (size_t i = 0; i < sizeof(connectors) / sizeof(connectors[0]); i++) {
+        if (starts_with_at(text, len, pos, connectors[i])) return 1;
+    }
+    return 0;
+}
+
+static int ends_with_punctuation(const char* text) {
+    return ends_with_text(text, "，") || ends_with_text(text, "、") ||
+           ends_with_text(text, "；") || ends_with_text(text, "：") ||
+           ends_with_text(text, "。") || ends_with_text(text, "！") ||
+           ends_with_text(text, "？") || ends_with_text(text, ",") ||
+           ends_with_text(text, ";") || ends_with_text(text, ":") ||
+           ends_with_text(text, ".") || ends_with_text(text, "!") ||
+           ends_with_text(text, "?");
+}
+
+// 仅在较明确的转折、承接和因果连接词前补逗号。
+// 不按固定字数机械切句，避免把普通短语拆开。
+static char* restore_clause_commas(const char* text, size_t len) {
+    char* output = (char*)malloc(len * 2 + 8);
+    if (!output) return NULL;
+
+    size_t out = 0;
+    size_t clause_start = 0;
+    for (size_t i = 0; i < len;) {
+        if (is_clause_boundary(text, len, i) &&
+            out > clause_start &&
+            out - clause_start >= 9 &&
+            !ends_with_punctuation(output)) {
+            memcpy(output + out, "，", 3);
+            out += 3;
+            clause_start = out;
+        }
+
+        // UTF-8 中文字符按 3 字节复制，其他字符逐字节复制；
+        // 连接词匹配只在当前扫描位置进行。
+        output[out++] = text[i++];
+    }
+
+    output[out] = '\0';
+    return output;
+}
+
+// 在提交给 OpenCode 前恢复句内逗号和句尾标点。
+// 不改写词语，不依赖额外模型；疑问语气采用保守的词尾规则判断。
 static char* normalize_asr_punctuation(const char* text) {
     if (!text) return NULL;
 
@@ -453,8 +510,7 @@ static char* normalize_asr_punctuation(const char* text) {
 
     // 去掉误留在句尾的分隔符，再统一补句末标点。
     while (len > 0) {
-        unsigned char c = (unsigned char)text[len - 1];
-        if (c == ',' || c == ';' || c == ':') {
+        if (text[len - 1] == ',' || text[len - 1] == ';' || text[len - 1] == ':') {
             len--;
             continue;
         }
@@ -471,10 +527,14 @@ static char* normalize_asr_punctuation(const char* text) {
 
     if (len == 0) return NULL;
 
-    char* result = (char*)malloc(len + 4);
+    char* trimmed = (char*)malloc(len + 1);
+    if (!trimmed) return NULL;
+    memcpy(trimmed, text, len);
+    trimmed[len] = '\0';
+
+    char* result = restore_clause_commas(trimmed, len);
+    free(trimmed);
     if (!result) return NULL;
-    memcpy(result, text, len);
-    result[len] = '\0';
 
     // 已有句末标点时不重复添加。
     if (ends_with_text(result, "。") || ends_with_text(result, "！") ||
@@ -497,8 +557,14 @@ static char* normalize_asr_punctuation(const char* text) {
         }
     }
 
-    memcpy(result + len, is_question ? "？" : "。", 4);
-    return result;
+    size_t result_len = strlen(result);
+    char* punctuated = (char*)realloc(result, result_len + 4);
+    if (!punctuated) {
+        free(result);
+        return NULL;
+    }
+    memcpy(punctuated + result_len, is_question ? "？" : "。", 4);
+    return punctuated;
 }
 
 // ============= 处理识别结果 =============
