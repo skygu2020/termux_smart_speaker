@@ -3,12 +3,18 @@
 
 /*
  * OpenCode HTTP API client for Termux Smart Speaker.
- *
- * The client connects only to the local opencode2 service. It never starts
- * another OpenCode process and never reuses unrelated project sessions.
+ * The reply carries the exact OpenCode session/message identity so every
+ * TTS producer can use the same server-side idempotency key.
  */
+typedef struct {
+    char *text;
+    char *session_id;
+    char *message_id;
+} OpenCodeReply;
+
 int opencode_init(void);
-char *opencode_send_message(const char *message);
+int opencode_send_message(const char *message, OpenCodeReply *reply);
+void opencode_reply_free(OpenCodeReply *reply);
 void opencode_close(void);
 
 #endif
