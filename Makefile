@@ -32,13 +32,19 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+zipvoice_test: zipvoice_test.c
+	$(CXX) $(CFLAGS) -o $@ $< -L./lib \
+		-Wl,--start-group \
+		-lsherpa-onnx-c-api -lonnxruntime -lm -lpthread -llog \
+		-Wl,--end-group -lc++_shared -landroid
+
 tts_server: tts_server.c
 	$(CC) $(CFLAGS) -o $@ $< -L./lib \
 		-lsherpa-onnx-c-api -lonnxruntime -lOpenSLES \
 		-lm -lpthread -lcjson
 
 clean:
-	rm -f $(OBJS) $(TARGET) tts_server
+	rm -f $(OBJS) $(TARGET) tts_server zipvoice_test
 
 run: $(TARGET)
 	@echo "运行程序..."
