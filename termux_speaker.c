@@ -745,8 +745,11 @@ static int init_asr(void) {
     config.decoding_method = "greedy_search";
     config.max_active_paths = 4;
     config.enable_endpoint = 1;
-    config.rule1_min_trailing_silence = 2.4;
-    config.rule2_min_trailing_silence = 1.2;
+    // 延长端点静音判定，避免用户在一句话中短暂停顿时被提前提交。
+    // rule1 适用于普通语句；rule2 适用于达到对应长度条件的语句，
+    // 两者都提高到接近 3 秒，优先保证完整收句。
+    config.rule1_min_trailing_silence = 3.0;
+    config.rule2_min_trailing_silence = 2.8;
     config.rule3_min_utterance_length = 300;
     
     g_recognizer = (SherpaOnnxOnlineRecognizer*)SherpaOnnxCreateOnlineRecognizer(&config);
