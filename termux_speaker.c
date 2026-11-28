@@ -366,13 +366,13 @@ static void call_tts(const char* text) {
 
     // 原子递增：即使未来从多个线程调用，也能区分每一次调用。
     unsigned long call_id = __sync_add_and_fetch(&g_tts_call_sequence, 1);
-    printf("\\n[TTS-CALL #%lu] call_tts() 被调用，文本长度=%zu，内容=%s\\n",
+    printf("\n[TTS-CALL #%lu] call_tts() 被调用，文本长度=%zu，内容=%s\n",
            call_id, strlen(text), text);
     fflush(stdout);
 
     cJSON* root = cJSON_CreateObject();
     if (!root) {
-        fprintf(stderr, "[TTS-CALL #%lu] 创建 JSON 对象失败\\n", call_id);
+        fprintf(stderr, "[TTS-CALL #%lu] 创建 JSON 对象失败\n", call_id);
         return;
     }
     cJSON_AddStringToObject(root, "input", text);
@@ -382,16 +382,16 @@ static void call_tts(const char* text) {
     char* json_body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json_body) {
-        fprintf(stderr, "[TTS-CALL #%lu] JSON 序列化失败，未发送 HTTP 请求\\n", call_id);
+        fprintf(stderr, "[TTS-CALL #%lu] JSON 序列化失败，未发送 HTTP 请求\n", call_id);
         return;
     }
 
-    printf("[TTS-CALL #%lu] 开始发送 HTTP POST -> %s\\n", call_id, TTS_URL);
+    printf("[TTS-CALL #%lu] 开始发送 HTTP POST -> %s\n", call_id, TTS_URL);
     fflush(stdout);
 
     char* response = http_post(TTS_URL, json_body);
 
-    printf("[TTS-CALL #%lu] HTTP POST 已返回，结果=%s\\n",
+    printf("[TTS-CALL #%lu] HTTP POST 已返回，结果=%s\n",
            call_id, response ? "收到响应正文" : "无响应正文或请求失败");
     fflush(stdout);
 
