@@ -220,8 +220,8 @@ static int stream_player_start(StreamPlayer *p) {
             fprintf(stderr, "[TTS] 设置播放状态失败: %u\n", (unsigned)r);
             return -1;
         }
-        p->sl_started = 1;
     }
+    p->sl_started = 1;
     fprintf(stderr, "[TTS-DIAG] request=%llu start play_state=%u state_query=%u\n",
             (unsigned long long)request_id, (unsigned)play_state,
             (unsigned)state_result);
