@@ -305,37 +305,61 @@ static char* clean_markdown(const char* text) {
 }
 
 // ============= HTTP 请求封装 =============
-static char* http_post(const char* url, const char* json_body) {
+static char* http_post(const char* url, const char* json_body,
+                        CURLcode* curl_result, long* http_status,
+                        size_t* response_size) {
+    if (curl_result) *curl_result = CURLE_FAILED_INIT;
+    if (http_status) *http_status = 0;
+    if (response_size) *response_size = 0;
+
     CURL* curl = curl_easy_init();
     if (!curl) return NULL;
-    
+
     struct curl_slist* headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
-    
+    if (!headers) {
+        curl_easy_cleanup(curl);
+        return NULL;
+    }
+
     HttpResponse resp = {0};
     resp.data = malloc(1);
+    if (!resp.data) {
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return NULL;
+    }
     resp.data[0] = '\0';
     resp.size = 0;
-    
+
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-    
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
     CURLcode res = curl_easy_perform(curl);
-    
+    long status = 0;
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    }
+    if (curl_result) *curl_result = res;
+    if (http_status) *http_status = status;
+    if (response_size) *response_size = resp.size;
+
+    // 服务端普通 TTS 接口当前只返回 HTTP 响应头，不保证有响应正文。
+    // 传输成功且 HTTP 状态为 2xx 即视为请求成功，空正文不再误报为失败。
     char* response_text = NULL;
-    if (res == CURLE_OK && resp.size > 0) {
+    if (res == CURLE_OK && status >= 200 && status < 300) {
         response_text = resp.data;
     } else {
         free(resp.data);
     }
-    
+
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    
     return response_text;
 }
 
@@ -395,10 +419,23 @@ static void call_tts_with_ids(const char* text, const char* session_id, const ch
     printf("[TTS-CALL #%lu] 开始发送 HTTP POST -> %s\n", call_id, TTS_URL);
     fflush(stdout);
 
-    char* response = http_post(TTS_URL, json_body);
+    CURLcode curl_result = CURLE_OK;
+    long http_status = 0;
+    size_t response_size = 0;
+    char* response = http_post(TTS_URL, json_body,
+                               &curl_result, &http_status, &response_size);
 
-    printf("[TTS-CALL #%lu] HTTP POST 已返回，结果=%s\n",
-           call_id, response ? "收到响应正文" : "无响应正文或请求失败");
+    if (response) {
+        printf("[TTS-CALL #%lu] HTTP POST 成功，HTTP=%ld，响应体=%zu 字节%s\n",
+               call_id, http_status, response_size,
+               response_size == 0 ? "（服务端正常返回空正文）" : "");
+    } else if (curl_result != CURLE_OK) {
+        fprintf(stderr, "[TTS-CALL #%lu] HTTP 传输失败：%s\n",
+                call_id, curl_easy_strerror(curl_result));
+    } else {
+        fprintf(stderr, "[TTS-CALL #%lu] HTTP 请求失败，状态码=%ld\n",
+                call_id, http_status);
+    }
     fflush(stdout);
 
     // 等待尾音消失
