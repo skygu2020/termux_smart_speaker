@@ -481,7 +481,7 @@ static char* restore_clause_commas(const char* text, size_t len) {
     size_t out = 0;
     size_t clause_start = 0;
     for (size_t i = 0; i < len;) {
-        output[out] = '\\0';
+        output[out] = '\0';
         if (is_clause_boundary(text, len, i) &&
             out > clause_start &&
             out - clause_start >= 9 &&
@@ -491,8 +491,7 @@ static char* restore_clause_commas(const char* text, size_t len) {
             clause_start = out;
         }
 
-        // UTF-8 中文字符按 3 字节复制，其他字符逐字节复制；
-        // 连接词匹配只在当前扫描位置进行。
+        // 逐字节保留原始 UTF-8 内容；连接词按完整 UTF-8 字节序列匹配。
         output[out++] = text[i++];
     }
 
