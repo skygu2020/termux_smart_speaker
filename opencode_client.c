@@ -482,12 +482,13 @@ static int wait_for_session(void) {
     return -1;
 }
 
-static char *read_latest_assistant_text(void) {
+static char *read_latest_assistant_text(char **message_id_out) {
     char path[256], *response = NULL, *result = NULL;
     long status = 0;
     cJSON *json, *data;
     int i, count;
 
+    if (message_id_out) *message_id_out = NULL;
     snprintf(path, sizeof(path), "/api/session/%s/message?limit=30&order=desc", g_session_id);
     if (api_request("GET", path, NULL, &response, &status) != 0 || status != 200) {
         fprintf(stderr, "[OpenCode] 读取会话消息失败，HTTP %ld\n", status);
@@ -509,15 +510,11 @@ static char *read_latest_assistant_text(void) {
         cJSON *entry = cJSON_GetArrayItem(data, i);
         cJSON *type = cJSON_GetObjectItemCaseSensitive(entry, "type");
         cJSON *content = cJSON_GetObjectItemCaseSensitive(entry, "content");
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(entry, "id");
         int j, part_count;
         size_t used = 0;
         char *joined = (char *)calloc(1, 1);
 
-        /*
-         * OpenCode v2.4.2 Session.Message.Info uses:
-         *   { "type": "assistant", "content": [{ "type": "text", "text": "..." }] }
-         * Reasoning and tool content are intentionally excluded from TTS.
-         */
         if (!type || !cJSON_IsString(type) || strcmp(type->valuestring, "assistant") != 0 ||
             !cJSON_IsArray(content)) {
             free(joined);
@@ -548,6 +545,10 @@ static char *read_latest_assistant_text(void) {
         }
         if (joined && used) {
             result = joined;
+            if (message_id_out && id && cJSON_IsString(id) &&
+                id->valuestring && *id->valuestring) {
+                *message_id_out = strdup(id->valuestring);
+            }
             break;
         }
         free(joined);
@@ -557,21 +558,23 @@ static char *read_latest_assistant_text(void) {
     return result;
 }
 
-char *opencode_send_message(const char *message) {
+int opencode_send_message(const char *message, OpenCodeReply *reply) {
     cJSON *root;
-    char *body, *response = NULL, *answer;
+    char *body, *response = NULL, *answer, *message_id = NULL;
     char path[256];
     long status = 0;
 
-    if (!message || !*message) return NULL;
-    if (!g_initialized && opencode_init() != 0) return NULL;
+    if (!reply) return -1;
+    memset(reply, 0, sizeof(*reply));
+    if (!message || !*message) return -1;
+    if (!g_initialized && opencode_init() != 0) return -1;
 
     root = cJSON_CreateObject();
-    if (!root) return NULL;
+    if (!root) return -1;
     cJSON_AddStringToObject(root, "text", message);
     body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!body) return NULL;
+    if (!body) return -1;
 
     snprintf(path, sizeof(path), "/api/session/%s/prompt", g_session_id);
     if (api_request("POST", path, body, &response, &status) != 0 || status != 200) {
@@ -579,19 +582,39 @@ char *opencode_send_message(const char *message) {
                 status, response ? response : "");
         free(body);
         free(response);
-        return NULL;
+        return -1;
     }
     free(body);
     free(response);
 
-    if (wait_for_session() != 0) return NULL;
-    answer = read_latest_assistant_text();
+    if (wait_for_session() != 0) return -1;
+    answer = read_latest_assistant_text(&message_id);
     if (!answer || !*answer) {
         free(answer);
+        free(message_id);
         fprintf(stderr, "[OpenCode] Agent 已结束，但没有可播报的文本回复\n");
-        return NULL;
+        return -1;
     }
-    return answer;
+
+    reply->text = answer;
+    reply->session_id = strdup(g_session_id);
+    reply->message_id = message_id;
+    if (!reply->session_id) {
+        opencode_reply_free(reply);
+        return -1;
+    }
+    if (!reply->message_id) {
+        fprintf(stderr, "[OpenCode] 警告：回复缺少 message_id，本次 TTS 无法参与跨客户端去重\n");
+    }
+    return 0;
+}
+
+void opencode_reply_free(OpenCodeReply *reply) {
+    if (!reply) return;
+    free(reply->text);
+    free(reply->session_id);
+    free(reply->message_id);
+    memset(reply, 0, sizeof(*reply));
 }
 
 void opencode_close(void) {
