@@ -481,6 +481,7 @@ static char* restore_clause_commas(const char* text, size_t len) {
     size_t out = 0;
     size_t clause_start = 0;
     for (size_t i = 0; i < len;) {
+        output[out] = '\\0';
         if (is_clause_boundary(text, len, i) &&
             out > clause_start &&
             out - clause_start >= 9 &&
