@@ -434,12 +434,83 @@ static void speak_text_with_ids(const char* text, const char* session_id, const 
 }
 
 // 统一的发送函数
+// ============= ASR 中文句尾标点整理 =============
+static int ends_with_text(const char* text, const char* suffix) {
+    size_t text_len = strlen(text);
+    size_t suffix_len = strlen(suffix);
+    return text_len >= suffix_len &&
+           memcmp(text + text_len - suffix_len, suffix, suffix_len) == 0;
+}
+
+// 在提交给 OpenCode 前补齐句尾标点。
+// 不改写识别内容，也不依赖额外模型；疑问语气采用保守的词尾规则判断。
+static char* normalize_asr_punctuation(const char* text) {
+    if (!text) return NULL;
+
+    while (*text && isspace((unsigned char)*text)) text++;
+    size_t len = strlen(text);
+    while (len > 0 && isspace((unsigned char)text[len - 1])) len--;
+
+    // 去掉误留在句尾的分隔符，再统一补句末标点。
+    while (len > 0) {
+        unsigned char c = (unsigned char)text[len - 1];
+        if (c == ',' || c == ';' || c == ':') {
+            len--;
+            continue;
+        }
+        if (len >= 3 &&
+            (memcmp(text + len - 3, "，", 3) == 0 ||
+             memcmp(text + len - 3, "、", 3) == 0 ||
+             memcmp(text + len - 3, "；", 3) == 0 ||
+             memcmp(text + len - 3, "：", 3) == 0)) {
+            len -= 3;
+            continue;
+        }
+        break;
+    }
+
+    if (len == 0) return NULL;
+
+    char* result = (char*)malloc(len + 4);
+    if (!result) return NULL;
+    memcpy(result, text, len);
+    result[len] = '\0';
+
+    // 已有句末标点时不重复添加。
+    if (ends_with_text(result, "。") || ends_with_text(result, "！") ||
+        ends_with_text(result, "？") || ends_with_text(result, ".") ||
+        ends_with_text(result, "!") || ends_with_text(result, "?")) {
+        return result;
+    }
+
+    static const char* question_suffixes[] = {
+        "吗", "呢", "什么", "怎么", "为什么", "为何", "谁",
+        "哪里", "哪儿", "哪个", "哪些", "多少", "几",
+        "是否", "能不能", "可不可以", "有没有", "是不是",
+        "要不要", "行不行", "好不好"
+    };
+    int is_question = 0;
+    for (size_t i = 0; i < sizeof(question_suffixes) / sizeof(question_suffixes[0]); i++) {
+        if (ends_with_text(result, question_suffixes[i])) {
+            is_question = 1;
+            break;
+        }
+    }
+
+    memcpy(result + len, is_question ? "？" : "。", 4);
+    return result;
+}
+
 // ============= 处理识别结果 =============
 static void process_recognized_text(const char* text) {
     if (!text || strlen(text) == 0) return;
 
+    char* normalized_text = normalize_asr_punctuation(text);
+    const char* submit_text = normalized_text ? normalized_text : text;
+    printf("[ASR] 提交文本: %s\\n", submit_text);
+
     OpenCodeReply reply = {0};
-    if (opencode_send_message(text, &reply) == 0 && reply.text && *reply.text) {
+    if (opencode_send_message(submit_text, &reply) == 0 && reply.text && *reply.text) {
         char* clean_response = clean_markdown(reply.text);
         if (clean_response && *clean_response) {
             speak_text_with_ids(clean_response, reply.session_id, reply.message_id);
@@ -450,6 +521,7 @@ static void process_recognized_text(const char* text) {
         opencode_reply_free(&reply);
         call_tts("抱歉，我没有理解你的问题");
     }
+    free(normalized_text);
 }
 
 /*
