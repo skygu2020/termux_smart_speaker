@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -23,6 +24,94 @@
 static volatile int g_running = 1;
 static const SherpaOnnxOfflineTts *g_tts = NULL;
 static pthread_mutex_t g_synthesis_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define TTS_DEDUP_CAPACITY 512
+#define TTS_DEDUP_TTL_SECONDS (24 * 60 * 60)
+typedef struct {
+    char session_id[160];
+    char message_id[160];
+    time_t created_at;
+    int state; /* 0=empty, 1=processing, 2=played */
+} TtsDedupEntry;
+static TtsDedupEntry g_tts_dedup[TTS_DEDUP_CAPACITY];
+static pthread_mutex_t g_tts_dedup_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Returns 0 for a newly reserved key, 1 for a duplicate, -1 if full/invalid. */
+static int tts_dedup_reserve(const char *session_id, const char *message_id) {
+    time_t now;
+    int free_slot = -1, oldest_slot = -1;
+    time_t oldest_time = 0;
+    size_t i;
+    if (!session_id || !*session_id || !message_id || !*message_id) return 0;
+    if (strlen(session_id) >= sizeof(g_tts_dedup[0].session_id) ||
+        strlen(message_id) >= sizeof(g_tts_dedup[0].message_id)) return -1;
+    now = time(NULL);
+    pthread_mutex_lock(&g_tts_dedup_mutex);
+    for (i = 0; i < TTS_DEDUP_CAPACITY; i++) {
+        TtsDedupEntry *entry = &g_tts_dedup[i];
+        if (entry->state == 2 && now >= entry->created_at &&
+            now - entry->created_at > TTS_DEDUP_TTL_SECONDS) {
+            memset(entry, 0, sizeof(*entry));
+        }
+        if (entry->state != 0 &&
+            strcmp(entry->session_id, session_id) == 0 &&
+            strcmp(entry->message_id, message_id) == 0) {
+            pthread_mutex_unlock(&g_tts_dedup_mutex);
+            return 1;
+        }
+        if (entry->state == 0 && free_slot < 0) free_slot = (int)i;
+        if (entry->state == 2 &&
+            (oldest_slot < 0 || entry->created_at < oldest_time)) {
+            oldest_slot = (int)i;
+            oldest_time = entry->created_at;
+        }
+    }
+    if (free_slot < 0) free_slot = oldest_slot;
+    if (free_slot < 0) {
+        pthread_mutex_unlock(&g_tts_dedup_mutex);
+        return -1; /* All slots are currently processing; fail closed. */
+    }
+    TtsDedupEntry *entry = &g_tts_dedup[free_slot];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->session_id, sizeof(entry->session_id), "%s", session_id);
+    snprintf(entry->message_id, sizeof(entry->message_id), "%s", message_id);
+    entry->created_at = now;
+    entry->state = 1;
+    pthread_mutex_unlock(&g_tts_dedup_mutex);
+    return 0;
+}
+
+static void tts_dedup_finish(const char *session_id, const char *message_id, int played) {
+    size_t i;
+    if (!session_id || !*session_id || !message_id || !*message_id) return;
+    pthread_mutex_lock(&g_tts_dedup_mutex);
+    for (i = 0; i < TTS_DEDUP_CAPACITY; i++) {
+        TtsDedupEntry *entry = &g_tts_dedup[i];
+        if (entry->state == 1 && strcmp(entry->session_id, session_id) == 0 &&
+            strcmp(entry->message_id, message_id) == 0) {
+            if (played) {
+                entry->state = 2;
+                entry->created_at = time(NULL);
+            } else {
+                memset(entry, 0, sizeof(*entry));
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_tts_dedup_mutex);
+}
+
+static void send_json_response(int fd, int code, const char *reason, const char *body) {
+    char header[512];
+    size_t body_len = strlen(body);
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+        code, reason, body_len);
+    if (n > 0) write(fd, header, (size_t)n);
+    if (body_len) write(fd, body, body_len);
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+}
 
 // ============= OpenSL ES 播放器 =============
 typedef struct {
@@ -311,14 +400,13 @@ static int32_t tts_progress_callback(const float *samples,int32_t n,float progre
     return 1;
 }
 
-static void handle_synthesize(const char *text,float speed,int client_fd,int is_stream) {
+static int handle_synthesize(const char *text,float speed,int client_fd,int is_stream) {
     pthread_mutex_lock(&g_synthesis_mutex);
     printf("[TTS] 开始增量合成: %s\n",text);
 
     if(stream_player_start(g_player)!=0) {
-        if(client_fd>0) { shutdown(client_fd,SHUT_RDWR); close(client_fd); }
         pthread_mutex_unlock(&g_synthesis_mutex);
-        return;
+        return -1;
     }
 
     SherpaOnnxGenerationConfig cfg;
@@ -337,6 +425,7 @@ static void handle_synthesize(const char *text,float speed,int client_fd,int is_
     const SherpaOnnxGeneratedAudio *audio=SherpaOnnxOfflineTtsGenerateWithConfig(
         g_tts,text,&cfg,tts_progress_callback,&ctx);
 
+    int played = 0;
     if(!audio || audio->n<=0 || ctx.failed) {
         fprintf(stderr,"[TTS] 增量合成失败%s\n",ctx.failed?"（播放队列入队失败）":"");
         stream_player_stop(g_player);
@@ -360,6 +449,7 @@ static void handle_synthesize(const char *text,float speed,int client_fd,int is_
                 g_player->queued_count, g_player->read_index, g_player->write_index);
         pthread_mutex_unlock(&g_player->mutex);
         printf("[TTS] 播放完成\n");
+        played = 1;
     }
 
     if(audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
@@ -373,6 +463,7 @@ static void handle_synthesize(const char *text,float speed,int client_fd,int is_
         close(client_fd);
     }
     pthread_mutex_unlock(&g_synthesis_mutex);
+    return played ? 0 : -1;
 }
 
 // ============= HTTP 服务器 =============
@@ -422,10 +513,16 @@ static void* handle_client(void* arg) {
     
     cJSON* input = cJSON_GetObjectItem(json, "input");
     cJSON* speed = cJSON_GetObjectItem(json, "speed");
+    cJSON* session_item = cJSON_GetObjectItemCaseSensitive(json, "session_id");
+    cJSON* message_item = cJSON_GetObjectItemCaseSensitive(json, "message_id");
     
     const char *input_text = cJSON_IsString(input) ? input->valuestring : "";
     char *text = strdup(input_text);
     float speed_val = cJSON_IsNumber(speed) ? (float)speed->valuedouble : 1.0f;
+    char *session_id = cJSON_IsString(session_item) && session_item->valuestring
+        ? strdup(session_item->valuestring) : NULL;
+    char *message_id = cJSON_IsString(message_item) && message_item->valuestring
+        ? strdup(message_item->valuestring) : NULL;
 
     cJSON_Delete(json);
     if (!text) {
@@ -436,6 +533,25 @@ static void* handle_client(void* arg) {
     }
 
     printf("[HTTP] 收到: %s\n", text);
+
+    int has_dedup_key = session_id && *session_id && message_id && *message_id;
+    int dedup_result = tts_dedup_reserve(session_id, message_id);
+    if (dedup_result == 1) {
+        printf("[TTS-DEDUP] 丢弃重复请求 session=%s message=%s\n", session_id, message_id);
+        send_json_response(client_fd, 200, "OK", "{\"status\":\"duplicate\",\"played\":false}");
+        free(text); free(session_id); free(message_id);
+        return NULL;
+    }
+    if (dedup_result < 0) {
+        send_json_response(client_fd, 503, "Service Unavailable", "{\"error\":\"dedup_capacity\"}");
+        free(text); free(session_id); free(message_id);
+        return NULL;
+    }
+    if (!has_dedup_key) {
+        printf("[TTS-DEDUP] 无 session/message ID，按普通 TTS 请求处理\n");
+    } else {
+        printf("[TTS-DEDUP] 首次请求 session=%s message=%s\n", session_id, message_id);
+    }
 
     int is_stream = (strstr(buffer, "text/event-stream") != NULL);
     
@@ -458,8 +574,11 @@ static void* handle_client(void* arg) {
     }
     
     // 处理合成
-    handle_synthesize(text, speed_val, client_fd, is_stream);
+    int synth_result = handle_synthesize(text, speed_val, client_fd, is_stream);
+    if (has_dedup_key) tts_dedup_finish(session_id, message_id, synth_result == 0);
     free(text);
+    free(session_id);
+    free(message_id);
     
     return NULL;
 }
