@@ -18,7 +18,7 @@
 #define SAMPLE_RATE 16000
 #define BUFFER_SIZE 512
 #define VAD_WINDOW_SIZE 512
-#define MAX_SEGMENT_DURATION 10
+#define MAX_SEGMENT_DURATION 25
 #define TTS_URL "http://127.0.0.1:8080/v1/audio/speech"
 
 
@@ -57,13 +57,13 @@ static void rebuild_kws(void);
 // ============= 全局变量 =============
 static volatile int g_running = 1;
 
-static SherpaOnnxOnlineRecognizer *g_recognizer = NULL;
+static const SherpaOnnxOfflineRecognizer *g_offline_recognizer = NULL;
 static SherpaOnnxVoiceActivityDetector *g_vad = NULL;
-static const SherpaOnnxDisplay *g_display = NULL;
+static pthread_t g_asr_thread;
+static int g_asr_thread_started = 0;
 
 static const SherpaOnnxKeywordSpotter *g_kws = NULL;
 static const SherpaOnnxOnlineStream *g_kws_stream = NULL;
-static SherpaOnnxOnlineStream *g_stream = NULL;
 static int g_wake_word_detected = 0;
 
 // OpenSL ES 录音相关
@@ -654,20 +654,21 @@ static void process_recognized_text(const char* text) {
 */
 // ============= 入队/出队 =============
 static void enqueue_audio(const float* samples, int num_samples) {
-    AudioQueue* node = (AudioQueue*)malloc(sizeof(AudioQueue));
-    node->data = (float*)malloc(num_samples * sizeof(float));
-    memcpy(node->data, samples, num_samples * sizeof(float));
+    if (!samples || num_samples <= 0) return;
+    AudioQueue* node = (AudioQueue*)calloc(1, sizeof(AudioQueue));
+    if (!node) return;
+    node->data = (float*)malloc((size_t)num_samples * sizeof(float));
+    if (!node->data) { free(node); return; }
+    memcpy(node->data, samples, (size_t)num_samples * sizeof(float));
     node->size = num_samples;
-    node->next = NULL;
-    
     pthread_mutex_lock(&g_queue_mutex);
-    if (g_queue_tail) {
-        g_queue_tail->next = node;
-        g_queue_tail = node;
-    } else {
-        g_queue_head = g_queue_tail = node;
+    if (!g_running || g_system_state != STATE_WAKEUP) {
+        pthread_mutex_unlock(&g_queue_mutex);
+        free(node->data); free(node); return;
     }
-    pthread_cond_signal(&g_queue_cond);
+    if (g_queue_tail) { g_queue_tail->next = node; g_queue_tail = node; }
+    else { g_queue_head = g_queue_tail = node; }
+    pthread_cond_broadcast(&g_queue_cond);
     pthread_mutex_unlock(&g_queue_mutex);
 }
 
@@ -726,56 +727,11 @@ static void recorder_callback(SLAndroidSimpleBufferQueueItf bq, void* context) {
             
         
         case STATE_WAKEUP:
-            // ========== 唤醒后识别 ==========
-            if (g_wake_word_detected) {
-                // 添加静态变量来保存识别结果
-                static char last_text[1024] = {0};
-                
-                // 直接进行 ASR 识别
-                SherpaOnnxOnlineStreamAcceptWaveform(g_stream, SAMPLE_RATE, float_buffer, BUFFER_SIZE);
-                
-                while (SherpaOnnxIsOnlineStreamReady(g_recognizer, g_stream)) {
-                    SherpaOnnxDecodeOnlineStream(g_recognizer, g_stream);
-                }
-                
-                const SherpaOnnxOnlineRecognizerResult* result = 
-                    SherpaOnnxGetOnlineStreamResult(g_recognizer, g_stream);
-                
-                if (result->text && strlen(result->text) > 0) {
-                    if (strcmp(last_text, result->text) != 0) {
-                        strcpy(last_text, result->text);
-                        printf("\r🎙️ 识别中: %-60s", result->text);
-                        fflush(stdout);
-                    }
-                }
-                
-                // 端点检测：先锁定本轮结果并切换状态，再执行阻塞的 OpenCode/TTS。
-                // 防止端点回调重入时重复提交同一段识别文本。
-                if (SherpaOnnxOnlineStreamIsEndpoint(g_recognizer, g_stream)) {
-                    if (last_text[0] != '\0' &&
-                        __sync_lock_test_and_set(&g_endpoint_processing, 1) == 0) {
-                        char final_text[sizeof(last_text)];
-                        snprintf(final_text, sizeof(final_text), "%s", last_text);
-                        g_system_state = STATE_TTS;
-                        g_wake_word_detected = 0;
-                        SherpaOnnxOnlineStreamReset(g_recognizer, g_stream);
-                        last_text[0] = '\0';
-
-                        printf("\n📝 识别结果: %s\n", final_text);
-                        process_recognized_text(final_text);
-
-                        g_system_state = STATE_IDLE;
-                        __sync_lock_release(&g_endpoint_processing);
-                    } else {
-                        SherpaOnnxOnlineStreamReset(g_recognizer, g_stream);
-                        last_text[0] = '\0';
-                    }
-                }
-                
-                SherpaOnnxDestroyOnlineRecognizerResult(result);
-            }
+            // SenseVoice 是非流式模型：录音回调只投递音频，
+            // 由 VAD 工作线程在完整语句结束后执行识别。
+            if (g_wake_word_detected) enqueue_audio(float_buffer, BUFFER_SIZE);
             break;
-            
+
         case STATE_TTS:
             // TTS 播放中，什么都不做，只保持录音循环
             break;
@@ -898,47 +854,39 @@ static int init_wake_word(void) {
 
 // ============= 初始化 ASR =============
 static int init_asr(void) {
-    SherpaOnnxOnlineRecognizerConfig config;
+    SherpaOnnxOfflineRecognizerConfig config;
     memset(&config, 0, sizeof(config));
-    
+
+    const char *model_path =
+        "./sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/model.int8.onnx";
+    const char *tokens_path =
+        "./sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/tokens.txt";
+
+    if (!SherpaOnnxFileExists(model_path) || !SherpaOnnxFileExists(tokens_path)) {
+        fprintf(stderr, "SenseVoice model files missing. Expected directory: "
+                        "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09\n");
+        return -1;
+    }
+
     config.feat_config.sample_rate = SAMPLE_RATE;
     config.feat_config.feature_dim = 80;
+    config.model_config.sense_voice.model = model_path;
+    config.model_config.sense_voice.language = "auto";
+    config.model_config.sense_voice.use_itn = 1;
+    config.model_config.tokens = tokens_path;
     config.model_config.num_threads = 2;
     config.model_config.provider = "cpu";
     config.model_config.debug = 0;
-    //config.model_config.tokens = "./bilingual-zh-en-2023-02-20/tokens.txt";
-    //config.model_config.transducer.encoder = "./bilingual-zh-en-2023-02-20/encoder-epoch-99-avg-1.int8.onnx";
-    //config.model_config.transducer.decoder = "./bilingual-zh-en-2023-02-20/decoder-epoch-99-avg-1.onnx";
-    //config.model_config.transducer.joiner = "./bilingual-zh-en-2023-02-20/joiner-epoch-99-avg-1.int8.onnx";
-    
-    config.model_config.tokens = "./sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30/tokens.txt";
-    config.model_config.transducer.encoder = "./sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30/encoder.int8.onnx";
-    config.model_config.transducer.decoder = "./sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30/decoder.onnx";
-    config.model_config.transducer.joiner = "./sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30/joiner.int8.onnx";
-    
-    
     config.decoding_method = "greedy_search";
     config.max_active_paths = 4;
-    config.enable_endpoint = 1;
-    // 延长端点静音判定，避免用户在一句话中短暂停顿时被提前提交。
-    // rule1 适用于普通语句；rule2 适用于达到对应长度条件的语句，
-    // 两者都提高到接近 3 秒，优先保证完整收句。
-    config.rule1_min_trailing_silence = 3.0;
-    config.rule2_min_trailing_silence = 2.8;
-    config.rule3_min_utterance_length = 300;
-    
-    g_recognizer = (SherpaOnnxOnlineRecognizer*)SherpaOnnxCreateOnlineRecognizer(&config);
-    if (!g_recognizer) return -1;
-    
-    // 创建 ASR 流
-    g_stream = (SherpaOnnxOnlineStream*)SherpaOnnxCreateOnlineStream(g_recognizer);
-    if (!g_stream) {
-        printf("❌ ASR 流创建失败\n");
+
+    printf("Loading SenseVoiceSmall INT8 (2 threads)...\n");
+    g_offline_recognizer = SherpaOnnxCreateOfflineRecognizer(&config);
+    if (!g_offline_recognizer) {
+        fprintf(stderr, "SenseVoice ASR initialization failed\n");
         return -1;
     }
-    
-    g_display = SherpaOnnxCreateDisplay(50);
-    printf("✅ ASR 初始化成功\n");
+    printf("SenseVoiceSmall multilingual ASR initialized\n");
     return 0;
 }
 
@@ -949,7 +897,8 @@ static int init_vad(void) {
     
     vad_config.silero_vad.model = "./silero_vad.onnx";
     vad_config.silero_vad.threshold = 0.5;
-    vad_config.silero_vad.min_silence_duration = 0.5;
+    // Offline SenseVoice needs a complete utterance; retain the ~3s pause tolerance.
+    vad_config.silero_vad.min_silence_duration = 2.8;
     vad_config.silero_vad.min_speech_duration = 0.25;
     vad_config.silero_vad.max_speech_duration = MAX_SEGMENT_DURATION;
     vad_config.silero_vad.window_size = VAD_WINDOW_SIZE;
@@ -966,94 +915,63 @@ static int init_vad(void) {
 
 // ============= VAD + ASR 处理线程 =============
 static void* vad_asr_thread(void* arg) {
-    SherpaOnnxOnlineStream* stream = (SherpaOnnxOnlineStream*)SherpaOnnxCreateOnlineStream(g_recognizer);
-    char accumulated_text[4096] = {0};
-    char last_result[4096] = {0};
-    int in_speech = 0;
-    int silence_frames = 0;
-    
+    (void)arg;
     while (g_running) {
-        
         AudioQueue* node = dequeue_audio();
         if (!node) continue;
-        
-        SherpaOnnxVoiceActivityDetectorAcceptWaveform(g_vad, node->data, node->size);
-        SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, node->data, node->size);
-        
-        while (SherpaOnnxIsOnlineStreamReady(g_recognizer, stream)) {
-            SherpaOnnxDecodeOnlineStream(g_recognizer, stream);
+
+        if (g_system_state == STATE_WAKEUP && g_wake_word_detected) {
+            SherpaOnnxVoiceActivityDetectorAcceptWaveform(g_vad, node->data, node->size);
         }
-        
-        const SherpaOnnxOnlineRecognizerResult* result = 
-            SherpaOnnxGetOnlineStreamResult(g_recognizer, stream);
-        
-        if (result->text && strlen(result->text) > 0) {
-            if (strcmp(last_result, result->text) != 0) {
-                strcpy(last_result, result->text);
-                printf("\r🎙️ 识别中: %-60s", result->text);
-                fflush(stdout);
-            }
-        }
-        SherpaOnnxDestroyOnlineRecognizerResult(result);
-        
-        int has_speech = 0;
-        while (!SherpaOnnxVoiceActivityDetectorEmpty(g_vad)) {
-            const SherpaOnnxSpeechSegment* segment = 
+        free(node->data);
+        free(node);
+
+        while (g_running && g_system_state == STATE_WAKEUP &&
+               g_wake_word_detected && !SherpaOnnxVoiceActivityDetectorEmpty(g_vad)) {
+            const SherpaOnnxSpeechSegment* segment =
                 SherpaOnnxVoiceActivityDetectorFront(g_vad);
-            if (segment && segment->n > 0) {
-                has_speech = 1;
-                if (!in_speech) {
-                    in_speech = 1;
-                    silence_frames = 0;
-                    printf("\n🎙️ 语音开始\n");
+            if (!segment) {
+                SherpaOnnxVoiceActivityDetectorPop(g_vad);
+                continue;
+            }
+
+            if (segment->samples && segment->n > 0) {
+                const SherpaOnnxOfflineStream* stream =
+                    SherpaOnnxCreateOfflineStream(g_offline_recognizer);
+                if (stream) {
+                    SherpaOnnxAcceptWaveformOffline(
+                        stream, SAMPLE_RATE, segment->samples, segment->n);
+                    SherpaOnnxDecodeOfflineStream(g_offline_recognizer, stream);
+                    const SherpaOnnxOfflineRecognizerResult* result =
+                        SherpaOnnxGetOfflineStreamResult(stream);
+
+                    if (result && result->text && result->text[0] != '\0') {
+                        char final_text[4096];
+                        snprintf(final_text, sizeof(final_text), "%s", result->text);
+                        if (__sync_lock_test_and_set(&g_endpoint_processing, 1) == 0) {
+                            g_system_state = STATE_TTS;
+                            g_wake_word_detected = 0;
+                            clear_audio_queue();
+                            SherpaOnnxVoiceActivityDetectorReset(g_vad);
+                            printf("\n📝 SenseVoice 识别结果: %s\n", final_text);
+                            process_recognized_text(final_text);
+                            g_system_state = STATE_IDLE;
+                            __sync_lock_release(&g_endpoint_processing);
+                        }
+                    } else {
+                        printf("[ASR] SenseVoice returned no text (%d samples)\n", segment->n);
+                    }
+                    if (result) SherpaOnnxDestroyOfflineRecognizerResult(result);
+                    SherpaOnnxDestroyOfflineStream(stream);
+                } else {
+                    fprintf(stderr, "[ASR] Failed to create SenseVoice stream\n");
                 }
             }
+
             SherpaOnnxDestroySpeechSegment(segment);
             SherpaOnnxVoiceActivityDetectorPop(g_vad);
         }
-        
-        if (in_speech && !has_speech) {
-            silence_frames++;
-        } else {
-            silence_frames = 0;
-        }
-        
-        int is_endpoint = SherpaOnnxOnlineStreamIsEndpoint(g_recognizer, stream);
-        
-        if (in_speech && (silence_frames > 10 || is_endpoint)) {
-            printf("\n🔇 语音结束\n");
-            
-            usleep(300000);
-            
-            while (SherpaOnnxIsOnlineStreamReady(g_recognizer, stream)) {
-                SherpaOnnxDecodeOnlineStream(g_recognizer, stream);
-            }
-            
-            const SherpaOnnxOnlineRecognizerResult* final_result = 
-                SherpaOnnxGetOnlineStreamResult(g_recognizer, stream);
-            
-            if (final_result->text && strlen(final_result->text) > 0) {
-                strcpy(accumulated_text, final_result->text);
-                printf("📝 识别结果: %s\n", accumulated_text);
-                
-                if (strlen(accumulated_text) > 0) {
-                    process_recognized_text(accumulated_text);
-                }
-            }
-            SherpaOnnxDestroyOnlineRecognizerResult(final_result);
-            
-            SherpaOnnxOnlineStreamReset(g_recognizer, stream);
-            accumulated_text[0] = '\0';
-            last_result[0] = '\0';
-            in_speech = 0;
-            silence_frames = 0;
-        }
-        
-        free(node->data);
-        free(node);
     }
-    
-    SherpaOnnxDestroyOnlineStream(stream);
     return NULL;
 }
 
@@ -1094,6 +1012,12 @@ int main() {
         fprintf(stderr, "❌ VAD 初始化失败\n");
         return 1;
     }
+
+    if (pthread_create(&g_asr_thread, NULL, vad_asr_thread, NULL) != 0) {
+        fprintf(stderr, "❌ ASR 工作线程创建失败\n");
+        return 1;
+    }
+    g_asr_thread_started = 1;
     
     if (init_recorder() != 0) {
         fprintf(stderr, "❌ 录音初始化失败\n");
@@ -1111,13 +1035,19 @@ int main() {
     
     stop_recording();
     g_running = 0;
+    pthread_mutex_lock(&g_queue_mutex);
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_mutex_unlock(&g_queue_mutex);
+    if (g_asr_thread_started) {
+        pthread_join(g_asr_thread, NULL);
+        g_asr_thread_started = 0;
+    }
+    clear_audio_queue();
     opencode_close();
     
     if (g_vad) SherpaOnnxDestroyVoiceActivityDetector(g_vad);
-    if (g_recognizer) SherpaOnnxDestroyOnlineRecognizer(g_recognizer);
-    if (g_display) SherpaOnnxDestroyDisplay(g_display);
+    if (g_offline_recognizer) SherpaOnnxDestroyOfflineRecognizer(g_offline_recognizer);
     if (g_kws_stream) SherpaOnnxDestroyOnlineStream(g_kws_stream);
-    if (g_stream) SherpaOnnxDestroyOnlineStream(g_stream);
     if (g_kws) SherpaOnnxDestroyKeywordSpotter(g_kws);
     
     
