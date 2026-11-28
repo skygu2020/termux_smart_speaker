@@ -50,6 +50,7 @@ typedef enum {
 } SystemState;
 
 static volatile int g_system_state = STATE_IDLE;
+static volatile int g_endpoint_processing = 0;
 static int init_wake_word(void);
 static void rebuild_kws(void);
 
@@ -565,16 +566,27 @@ static void recorder_callback(SLAndroidSimpleBufferQueueItf bq, void* context) {
                     }
                 }
                 
-                // 端点检测
+                // 端点检测：先锁定本轮结果并切换状态，再执行阻塞的 OpenCode/TTS。
+                // 防止端点回调重入时重复提交同一段识别文本。
                 if (SherpaOnnxOnlineStreamIsEndpoint(g_recognizer, g_stream)) {
-                    if (strlen(last_text) > 0) {
-                        printf("\n📝 识别结果: %s\n", last_text);
-                        process_recognized_text(last_text);
-                        g_system_state = STATE_IDLE; // 等待 TTS 完成后会变为 IDLE
-                        g_wake_word_detected = 0;  // 识别完成，退出唤醒状态
+                    if (last_text[0] != '\0' &&
+                        __sync_lock_test_and_set(&g_endpoint_processing, 1) == 0) {
+                        char final_text[sizeof(last_text)];
+                        snprintf(final_text, sizeof(final_text), "%s", last_text);
+                        g_system_state = STATE_TTS;
+                        g_wake_word_detected = 0;
+                        SherpaOnnxOnlineStreamReset(g_recognizer, g_stream);
+                        last_text[0] = '\0';
+
+                        printf("\n📝 识别结果: %s\n", final_text);
+                        process_recognized_text(final_text);
+
+                        g_system_state = STATE_IDLE;
+                        __sync_lock_release(&g_endpoint_processing);
+                    } else {
+                        SherpaOnnxOnlineStreamReset(g_recognizer, g_stream);
+                        last_text[0] = '\0';
                     }
-                    SherpaOnnxOnlineStreamReset(g_recognizer, g_stream);
-                    last_text[0] = '\0';
                 }
                 
                 SherpaOnnxDestroyOnlineRecognizerResult(result);
