@@ -934,6 +934,9 @@ static void* vad_asr_thread(void* arg) {
                 SherpaOnnxVoiceActivityDetectorPop(g_vad);
                 continue;
             }
+            // Front() returns an owned copy, so dequeue the detector segment now.
+            // This also keeps Reset() below from being followed by Pop() on an empty queue.
+            SherpaOnnxVoiceActivityDetectorPop(g_vad);
 
             if (segment->samples && segment->n > 0) {
                 const SherpaOnnxOfflineStream* stream =
@@ -969,7 +972,6 @@ static void* vad_asr_thread(void* arg) {
             }
 
             SherpaOnnxDestroySpeechSegment(segment);
-            SherpaOnnxVoiceActivityDetectorPop(g_vad);
         }
     }
     return NULL;
