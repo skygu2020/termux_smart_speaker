@@ -507,7 +507,7 @@ static void process_recognized_text(const char* text) {
 
     char* normalized_text = normalize_asr_punctuation(text);
     const char* submit_text = normalized_text ? normalized_text : text;
-    printf("[ASR] 提交文本: %s\\n", submit_text);
+    printf("[ASR] 提交文本: %s\n", submit_text);
 
     OpenCodeReply reply = {0};
     if (opencode_send_message(submit_text, &reply) == 0 && reply.text && *reply.text) {
