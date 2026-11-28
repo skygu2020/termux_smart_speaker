@@ -368,6 +368,10 @@ static void call_tts_with_ids(const char* text, const char* session_id, const ch
     unsigned long call_id = __sync_add_and_fetch(&g_tts_call_sequence, 1);
     printf("\n[TTS-CALL #%lu] call_tts() 被调用，文本长度=%zu，内容=%s\n",
            call_id, strlen(text), text);
+    if (session_id && *session_id && message_id && *message_id) {
+        printf("[TTS-CALL #%lu] OpenCode identity session=%s message=%s\\n",
+               call_id, session_id, message_id);
+    }
     fflush(stdout);
 
     cJSON* root = cJSON_CreateObject();
@@ -427,10 +431,6 @@ static void speak_text_with_ids(const char* text, const char* session_id, const 
     // ========== 关键：重建 KWS ==========
     rebuild_kws();
     
-}
-
-static void speak_text(const char* text) {
-    speak_text_with_ids(text, NULL, NULL);
 }
 
 // 统一的发送函数
