@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
