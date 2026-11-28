@@ -140,7 +140,7 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  if (SherpaOnnxWriteWave(audio->samples, audio->n, audio->sample_rate, output) != 0) {
+  if (SherpaOnnxWriteWave(audio->samples, audio->n, audio->sample_rate, output) == 0) {
     fprintf(stderr, "Failed to write output WAV: %s\n", output);
     goto cleanup;
   }
