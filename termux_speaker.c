@@ -982,7 +982,7 @@ static void signal_handler(int sig) {
     printf("\n🛑 正在退出...\n");
     g_running = 0;
     //exit(0);
-    pthread_cond_signal(&g_queue_cond);
+    pthread_cond_broadcast(&g_queue_cond);
 }
 
 // ============= 主函数 =============
@@ -1002,7 +1002,8 @@ int main() {
     }
     if (init_wake_word() != 0) {
         printf("⚠️ 唤醒词功能未启用，将一直处于唤醒状态\n");
-        g_wake_word_detected = 1;  // 降级为一直识别
+        g_wake_word_detected = 1;
+        g_system_state = STATE_WAKEUP;
     }
     
     if (init_asr() != 0) {
