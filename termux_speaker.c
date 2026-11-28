@@ -358,26 +358,49 @@ static void rebuild_kws(void) {
     printf("[KWS] 重建完成\n");
 }
 
-// ============= 调用 TTS（设置播放标志）=============
+// ============= 调用 TTS（带调用编号诊断）=============
+static volatile unsigned long g_tts_call_sequence = 0;
+
 static void call_tts(const char* text) {
     if (!text || strlen(text) == 0) return;
-    
+
+    // 原子递增：即使未来从多个线程调用，也能区分每一次调用。
+    unsigned long call_id = __sync_add_and_fetch(&g_tts_call_sequence, 1);
+    printf("\\n[TTS-CALL #%lu] call_tts() 被调用，文本长度=%zu，内容=%s\\n",
+           call_id, strlen(text), text);
+    fflush(stdout);
+
     cJSON* root = cJSON_CreateObject();
+    if (!root) {
+        fprintf(stderr, "[TTS-CALL #%lu] 创建 JSON 对象失败\\n", call_id);
+        return;
+    }
     cJSON_AddStringToObject(root, "input", text);
     cJSON_AddStringToObject(root, "voice", "default");
     cJSON_AddNumberToObject(root, "speed", 1.0);
-    
+
     char* json_body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    
+    if (!json_body) {
+        fprintf(stderr, "[TTS-CALL #%lu] JSON 序列化失败，未发送 HTTP 请求\\n", call_id);
+        return;
+    }
+
+    printf("[TTS-CALL #%lu] 开始发送 HTTP POST -> %s\\n", call_id, TTS_URL);
+    fflush(stdout);
+
     char* response = http_post(TTS_URL, json_body);
-    
+
+    printf("[TTS-CALL #%lu] HTTP POST 已返回，结果=%s\\n",
+           call_id, response ? "收到响应正文" : "无响应正文或请求失败");
+    fflush(stdout);
+
     // 等待尾音消失
     usleep(300000);
     clear_audio_queue();
-    
+
     free(json_body);
-    
+
     if (response) {
         free(response);
     }
