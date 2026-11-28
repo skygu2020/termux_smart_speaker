@@ -39,8 +39,7 @@ static pthread_mutex_t g_tts_dedup_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Returns 0 for a newly reserved key, 1 for a duplicate, -1 if full/invalid. */
 static int tts_dedup_reserve(const char *session_id, const char *message_id) {
     time_t now;
-    int free_slot = -1, oldest_slot = -1;
-    time_t oldest_time = 0;
+    int free_slot = -1;
     size_t i;
     if (!session_id || !*session_id || !message_id || !*message_id) return 0;
     if (strlen(session_id) >= sizeof(g_tts_dedup[0].session_id) ||
@@ -60,13 +59,7 @@ static int tts_dedup_reserve(const char *session_id, const char *message_id) {
             return 1;
         }
         if (entry->state == 0 && free_slot < 0) free_slot = (int)i;
-        if (entry->state == 2 &&
-            (oldest_slot < 0 || entry->created_at < oldest_time)) {
-            oldest_slot = (int)i;
-            oldest_time = entry->created_at;
-        }
     }
-    if (free_slot < 0) free_slot = oldest_slot;
     if (free_slot < 0) {
         pthread_mutex_unlock(&g_tts_dedup_mutex);
         return -1; /* All slots are currently processing; fail closed. */
@@ -405,6 +398,10 @@ static int handle_synthesize(const char *text,float speed,int client_fd,int is_s
     printf("[TTS] 开始增量合成: %s\n",text);
 
     if(stream_player_start(g_player)!=0) {
+        if (client_fd > 0) {
+            shutdown(client_fd, SHUT_RDWR);
+            close(client_fd);
+        }
         pthread_mutex_unlock(&g_synthesis_mutex);
         return -1;
     }
@@ -529,6 +526,8 @@ static void* handle_client(void* arg) {
         const char *response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write(client_fd, response, strlen(response));
         close(client_fd);
+        free(session_id);
+        free(message_id);
         return NULL;
     }
 
