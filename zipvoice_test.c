@@ -101,8 +101,8 @@ int main(int argc, char **argv) {
   config.model.provider = "cpu";
   config.model.debug = 0;
 
-  fprintf(stderr, "[ZipVoice] sherpa-onnx %s, ONNX Runtime %s\n",
-          SherpaOnnxGetVersionStr(), SherpaOnnxGetOnnxruntimeVersionStr());
+  fprintf(stderr, "[ZipVoice] sherpa-onnx %s\n",
+          SherpaOnnxGetVersionStr());
   fprintf(stderr, "[ZipVoice] loading model (threads=%d)...\n", threads);
   tts = SherpaOnnxCreateOfflineTts(&config);
   if (!tts) {
