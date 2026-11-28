@@ -369,7 +369,7 @@ static void call_tts_with_ids(const char* text, const char* session_id, const ch
     printf("\n[TTS-CALL #%lu] call_tts() 被调用，文本长度=%zu，内容=%s\n",
            call_id, strlen(text), text);
     if (session_id && *session_id && message_id && *message_id) {
-        printf("[TTS-CALL #%lu] OpenCode identity session=%s message=%s\\n",
+        printf("[TTS-CALL #%lu] OpenCode identity session=%s message=%s\n",
                call_id, session_id, message_id);
     }
     fflush(stdout);
