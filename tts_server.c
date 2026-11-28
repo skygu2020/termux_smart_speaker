@@ -36,7 +36,13 @@ typedef struct {
     int buffer_count, buffer_size;
     int read_index, write_index, queued_count;
     int playing, should_stop, producer_done, playback_complete;
-    int sl_started; // OpenSL ES 播放状态只启动一次，跨请求保持队列连续
+    int sl_started;
+    uint64_t next_request_id, active_request_id;
+    uint64_t request_enqueued_chunks, request_callback_chunks;
+    uint64_t request_enqueued_samples, request_callback_samples;
+    uint64_t request_late_callbacks;
+    int *slot_samples;
+    uint64_t *slot_request_ids;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 } StreamPlayer;
@@ -50,6 +56,17 @@ static void player_callback(SLBufferQueueItf caller, void *context) {
     pthread_mutex_lock(&p->mutex);
     if (!p->should_stop) {
         if (p->queued_count > 0) {
+            int slot = p->read_index;
+            uint64_t owner = p->slot_request_ids[slot];
+            int samples = p->slot_samples[slot];
+            if (owner == p->active_request_id) {
+                p->request_callback_chunks++;
+                p->request_callback_samples += (uint64_t)samples;
+            } else {
+                p->request_late_callbacks++;
+            }
+            p->slot_samples[slot] = 0;
+            p->slot_request_ids[slot] = 0;
             p->queued_count--;
             p->read_index = (p->read_index + 1) % p->buffer_count;
         }
@@ -71,7 +88,9 @@ static StreamPlayer *stream_player_init(int sample_rate, int buffer_count) {
     pthread_mutex_init(&p->mutex, NULL);
     pthread_cond_init(&p->cond, NULL);
     p->buffers = calloc((size_t)buffer_count, sizeof(short *));
-    if (!p->buffers) goto error;
+    p->slot_samples = calloc((size_t)buffer_count, sizeof(int));
+    p->slot_request_ids = calloc((size_t)buffer_count, sizeof(uint64_t));
+    if (!p->buffers || !p->slot_samples || !p->slot_request_ids) goto error;
     for (int i=0;i<buffer_count;i++) {
         p->buffers[i] = calloc((size_t)p->buffer_size, sizeof(short));
         if (!p->buffers[i]) goto error;
@@ -121,6 +140,8 @@ error:
     if (p->outputMixObject) (*p->outputMixObject)->Destroy(p->outputMixObject);
     if (p->engineObject) (*p->engineObject)->Destroy(p->engineObject);
     if (p->buffers) { for(int i=0;i<buffer_count;i++) free(p->buffers[i]); free(p->buffers); }
+    free(p->slot_samples);
+    free(p->slot_request_ids);
     pthread_mutex_destroy(&p->mutex);
     pthread_cond_destroy(&p->cond);
     free(p);
@@ -148,6 +169,10 @@ static int stream_player_enqueue(StreamPlayer *p,const short *data,int n) {
             fprintf(stderr,"[TTS] BufferQueue Enqueue 失败: %u\n",(unsigned)r);
             return -1;
         }
+        p->slot_samples[slot] = count;
+        p->slot_request_ids[slot] = p->active_request_id;
+        p->request_enqueued_chunks++;
+        p->request_enqueued_samples += (uint64_t)count;
         p->write_index=(p->write_index+1)%p->buffer_count;
         p->queued_count++;
         off+=count;
@@ -171,9 +196,18 @@ static int stream_player_start(StreamPlayer *p) {
     p->playing = 1;
     p->producer_done = 0;
     p->playback_complete = 0;
+    p->active_request_id = ++p->next_request_id;
+    p->request_enqueued_chunks = 0;
+    p->request_callback_chunks = 0;
+    p->request_enqueued_samples = 0;
+    p->request_callback_samples = 0;
+    p->request_late_callbacks = 0;
+    uint64_t request_id = p->active_request_id;
     pthread_mutex_unlock(&p->mutex);
 
-    if (!p->sl_started) {
+    SLuint32 play_state = SL_PLAYSTATE_STOPPED;
+    SLresult state_result = (*p->playerPlay)->GetPlayState(p->playerPlay, &play_state);
+    if (state_result != SL_RESULT_SUCCESS || play_state != SL_PLAYSTATE_PLAYING) {
         SLresult r = (*p->playerPlay)->SetPlayState(
             p->playerPlay, SL_PLAYSTATE_PLAYING);
         if (r != SL_RESULT_SUCCESS) {
@@ -187,6 +221,9 @@ static int stream_player_start(StreamPlayer *p) {
         }
         p->sl_started = 1;
     }
+    fprintf(stderr, "[TTS-DIAG] request=%llu start play_state=%u state_query=%u\n",
+            (unsigned long long)request_id, (unsigned)play_state,
+            (unsigned)state_result);
     return 0;
 }
 
@@ -226,6 +263,8 @@ static void stream_player_destroy(StreamPlayer* player) {
         if (player->buffers[i]) free(player->buffers[i]);
     }
     free(player->buffers);
+    free(player->slot_samples);
+    free(player->slot_request_ids);
     pthread_mutex_destroy(&player->mutex);
     pthread_cond_destroy(&player->cond);
     free(player);
@@ -306,6 +345,19 @@ static void handle_synthesize(const char *text,float speed,int client_fd,int is_
         stream_player_finish(g_player);
         printf("[TTS] 等待播放队列排空...\n");
         stream_player_wait(g_player);
+        pthread_mutex_lock(&g_player->mutex);
+        fprintf(stderr,
+                "[TTS-DIAG] request=%llu summary enq_chunks=%llu cb_chunks=%llu "
+                "enq_samples=%llu cb_samples=%llu late_cb=%llu queued=%d "
+                "read=%d write=%d\n",
+                (unsigned long long)g_player->active_request_id,
+                (unsigned long long)g_player->request_enqueued_chunks,
+                (unsigned long long)g_player->request_callback_chunks,
+                (unsigned long long)g_player->request_enqueued_samples,
+                (unsigned long long)g_player->request_callback_samples,
+                (unsigned long long)g_player->request_late_callbacks,
+                g_player->queued_count, g_player->read_index, g_player->write_index);
+        pthread_mutex_unlock(&g_player->mutex);
         printf("[TTS] 播放完成\n");
     }
 
