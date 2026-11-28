@@ -361,7 +361,7 @@ static void rebuild_kws(void) {
 // ============= 调用 TTS（带调用编号诊断）=============
 static volatile unsigned long g_tts_call_sequence = 0;
 
-static void call_tts(const char* text) {
+static void call_tts_with_ids(const char* text, const char* session_id, const char* message_id) {
     if (!text || strlen(text) == 0) return;
 
     // 原子递增：即使未来从多个线程调用，也能区分每一次调用。
@@ -378,6 +378,8 @@ static void call_tts(const char* text) {
     cJSON_AddStringToObject(root, "input", text);
     cJSON_AddStringToObject(root, "voice", "default");
     cJSON_AddNumberToObject(root, "speed", 1.0);
+    if (session_id && *session_id) cJSON_AddStringToObject(root, "session_id", session_id);
+    if (message_id && *message_id) cJSON_AddStringToObject(root, "message_id", message_id);
 
     char* json_body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -407,12 +409,16 @@ static void call_tts(const char* text) {
 }
 
 
+static void call_tts(const char* text) {
+    call_tts_with_ids(text, NULL, NULL);
+}
+
 // ============= 语音播报（设置播放标志）=============
-static void speak_text(const char* text) {
+static void speak_text_with_ids(const char* text, const char* session_id, const char* message_id) {
     if (!text || strlen(text) == 0) return;
     
     printf("[TTS] 开始播放: %s\n", text);
-    call_tts(text);
+    call_tts_with_ids(text, session_id, message_id);
     printf("[TTS] 播放完成\n");
     
     //usleep(300000);
@@ -423,50 +429,29 @@ static void speak_text(const char* text) {
     
 }
 
-// 统一的发送函数
-static char* send_to_agent(const char* message) {
-    return opencode_send_message(message);
+static void speak_text(const char* text) {
+    speak_text_with_ids(text, NULL, NULL);
 }
 
+// 统一的发送函数
 // ============= 处理识别结果 =============
 static void process_recognized_text(const char* text) {
     if (!text || strlen(text) == 0) return;
-    
-    //printf("[LLM] 发送: %s\n", text);
 
-    char* response = send_to_agent(text);
-    
-    if (response && strlen(response) > 0) {
-        char* clean_response = clean_markdown(response);
-        //printf("[LLM] 回复: %s\n", clean_response);
-        speak_text(clean_response);
-        //call_tts(clean_response);
-        free(clean_response);
-    }  else {
-            call_tts("抱歉，我没有理解你的问题");
-    }
-    free(response);
-    /*
-    else {
-        printf("[LLM] 无响应，尝试 webhook\n");
-        response = call_zero(text);
-        if (response && strlen(response) > 0) {
-            printf("[LLM] 回复: %s\n", response);
-            speak_text(response);
-            free(response);
-        } else {
-            printf("[LLM] 尝试直接 LLM\n");
-            response = call_llm(text);
-            if (response && strlen(response) > 0) {
-                printf("[LLM] 回复: %s\n", response);
-                speak_text(response);
-                free(response);
-            } else {
-                speak_text("抱歉，我没有理解你的问题");
-            }
+    OpenCodeReply reply = {0};
+    if (opencode_send_message(text, &reply) == 0 && reply.text && *reply.text) {
+        char* clean_response = clean_markdown(reply.text);
+        if (clean_response && *clean_response) {
+            speak_text_with_ids(clean_response, reply.session_id, reply.message_id);
         }
-    }*/
+        free(clean_response);
+        opencode_reply_free(&reply);
+    } else {
+        opencode_reply_free(&reply);
+        call_tts("抱歉，我没有理解你的问题");
+    }
 }
+
 /*
 static void process_recognized_text(const char* text) {
     if (!text || strlen(text) == 0) return;
