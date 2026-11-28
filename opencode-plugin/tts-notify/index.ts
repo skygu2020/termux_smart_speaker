@@ -12,7 +12,7 @@ type Pending = {
 function cleanText(input: string): string {
   const ticks = String.fromCharCode(96);
   let text = input
-    .replace(new RegExp(ticks + "{3}[\\\\s\\\\S]*?" + ticks + "{3}", "g"), " ")
+    .replace(new RegExp(ticks + "{3}[\\s\\S]*?" + ticks + "{3}", "g"), " ")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
     .replace(new RegExp(ticks + "([^" + ticks + "]+)" + ticks, "g"), "$1")
